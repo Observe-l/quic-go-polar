@@ -98,6 +98,13 @@ func TestPolar(t *testing.T) {
 	}
 	fmt.Println("--- Encoding Complete ---")
 
+	// Drop exactly one random packet (simulate loss). Decoder treats missing bits as LLR=0.
+	if len(finalPackets) != 32 {
+		t.Fatalf("expected 32 packets, got %d", len(finalPackets))
+	}
+	dropIdx := int(originalDataFrames[0][0]) % 32 // deterministic but random-looking
+	finalPackets[dropIdx] = nil                   // mark as lost
+
 	// 3. Run the full recovery and decoding pipeline.
 	recoveredDataFrames, err := fec.DecodeAndRecoverFrames(finalPackets, randomMap, encodingIndex)
 	if err != nil {

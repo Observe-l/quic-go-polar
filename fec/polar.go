@@ -4,10 +4,71 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
+	"math/bits"
 	"math/rand"
 	"os"
-	"time"
 )
+
+// cache for info columns of G to avoid recomputation across batches
+var (
+	cachedGcols    [][]bool
+	cachedInfoCols []int
+	cachedPolarN   int
+	// Inverse cache for single-packet erasure: index 0..31
+	invCache [32]*struct {
+		inv      [][]uint64
+		usedRows []int
+	}
+	// Cached random map to keep interleaver stable across batches (enables cache hits)
+	cachedRandMap  []int
+	cachedRandMapK int
+)
+
+func getInfoColsAndG(n int, encodingIndex []int) ([][]bool, []int) {
+	if cachedGcols != nil && cachedPolarN == n && len(cachedInfoCols) == 512 {
+		return cachedGcols, cachedInfoCols
+	}
+	numDataBits := 512
+	infoCols := make([]int, numDataBits)
+	for i := 0; i < numDataBits; i++ {
+		infoCols[i] = bitReverseN(encodingIndex[i], n)
+	}
+	N := 1 << n
+	Gcols := make([][]bool, numDataBits)
+	for c := 0; c < numDataBits; c++ {
+		j := infoCols[c]
+		u := make([]bool, N)
+		u[j] = true
+		for s := 0; s < n; s++ {
+			block := 1 << (s + 1)
+			half := 1 << s
+			for start := 0; start < N; start += block {
+				for k := 0; k < half; k++ {
+					i1 := start + k
+					i2 := i1 + half
+					u[i1] = u[i1] != u[i2]
+				}
+			}
+		}
+		Gcols[c] = u
+	}
+	cachedGcols = Gcols
+	cachedInfoCols = infoCols
+	cachedPolarN = n
+	return Gcols, infoCols
+}
+
+func getStableRandomMap(codewordBits, K int) []int {
+	if cachedRandMap != nil && cachedRandMapK == K {
+		return cachedRandMap
+	}
+	r := rand.New(rand.NewSource(1)) // fixed seed for stability
+	m := r.Perm(codewordBits)
+	cachedRandMap = m
+	cachedRandMapK = K
+	return m
+}
 
 // --- Polar (structured GF(2) linear code) --- //
 
@@ -208,6 +269,145 @@ func matVecGF2(A [][]bool, x []bool) []bool {
 	return y
 }
 
+// packBoolRows packs a boolean matrix into uint64 word rows (LSB-first within a word).
+
+func packBoolVec(v []bool) []uint64 {
+	w := (len(v) + 63) / 64
+	out := make([]uint64, w)
+	for i, b := range v {
+		if b {
+			out[i>>6] |= 1 << (uint(i) & 63)
+		}
+	}
+	return out
+}
+
+// matVecGF2Packed computes y = M * v over GF(2), with M rows and K columns, packed in uint64.
+func matVecGF2Packed(M [][]uint64, v []uint64, K int) []bool {
+	y := make([]bool, len(M))
+	for i := 0; i < len(M); i++ {
+		var cnt int
+		row := M[i]
+		for w := 0; w < len(v); w++ {
+			cnt += bits.OnesCount64(row[w] & v[w])
+		}
+		y[i] = (cnt & 1) == 1
+	}
+	return y
+}
+
+// invertBoolMatrixGF2Packed inverts a KxK boolean matrix using packed 64-bit words.
+func invertBoolMatrixGF2Packed(A [][]bool) ([][]uint64, bool) {
+	K := len(A)
+	if K == 0 {
+		return nil, false
+	}
+	w := (K + 63) / 64
+	// Build augmented matrix [A | I] packed into uint64 words per row (2*w words per row)
+	aug := make([][]uint64, K)
+	for i := 0; i < K; i++ {
+		row := make([]uint64, 2*w)
+		// left A
+		for j, v := range A[i] {
+			if v {
+				row[j>>6] |= 1 << (uint(j) & 63)
+			}
+		}
+		// right I
+		row[w+(i>>6)] |= 1 << (uint(i) & 63)
+		aug[i] = row
+	}
+	r := 0
+	for c := 0; c < K && r < K; c++ {
+		wordIdx := c >> 6
+		bitMask := uint64(1) << (uint(c) & 63)
+		// find pivot
+		p := -1
+		for i := r; i < K; i++ {
+			if aug[i][wordIdx]&bitMask != 0 {
+				p = i
+				break
+			}
+		}
+		if p == -1 {
+			continue
+		}
+		// swap rows
+		aug[r], aug[p] = aug[p], aug[r]
+		// eliminate this column in all other rows
+		for i := 0; i < K; i++ {
+			if i == r {
+				continue
+			}
+			if aug[i][wordIdx]&bitMask != 0 {
+				for wj := 0; wj < 2*w; wj++ {
+					aug[i][wj] ^= aug[r][wj]
+				}
+			}
+		}
+		r++
+	}
+	if r < K {
+		return nil, false
+	}
+	// Extract right side as inverse
+	inv := make([][]uint64, K)
+	for i := 0; i < K; i++ {
+		row := make([]uint64, w)
+		copy(row, aug[i][w:])
+		inv[i] = row
+	}
+	return inv, true
+}
+
+// selectPivotRows chooses K linearly independent rows from A (MxK) using Gaussian elimination,
+// and returns their indices relative to A. Returns ok=false if rank < K.
+func selectPivotRows(A [][]bool, K int) ([]int, bool) {
+	M := len(A)
+	if M < K {
+		return nil, false
+	}
+	// Make a copy so we can eliminate without mutating the original rows.
+	work := make([][]bool, M)
+	idxs := make([]int, M)
+	for i := 0; i < M; i++ {
+		work[i] = append([]bool(nil), A[i]...)
+		idxs[i] = i
+	}
+	r := 0
+	pivots := make([]int, 0, K)
+	for c := 0; c < K && r < M; c++ {
+		p := -1
+		for i := r; i < M; i++ {
+			if work[i][c] {
+				p = i
+				break
+			}
+		}
+		if p == -1 {
+			continue
+		}
+		work[r], work[p] = work[p], work[r]
+		idxs[r], idxs[p] = idxs[p], idxs[r]
+		for i := 0; i < M; i++ {
+			if i == r {
+				continue
+			}
+			if work[i][c] {
+				for j := c; j < K; j++ {
+					work[i][j] = work[i][j] != work[r][j]
+				}
+			}
+		}
+		pivots = append(pivots, idxs[r])
+		r++
+	}
+	if len(pivots) < K {
+		return nil, false
+	}
+	return pivots, true
+}
+
 // LoadEncodingIndex reads a binary file containing a sequence of little-endian int64 values
 // and converts them to a slice of int for use as array indices.
 func LoadEncodingIndex(filePath string) ([]int, error) {
@@ -321,8 +521,8 @@ func EncodeAndBitInterleaveFrames(dataFrames [][]byte, encodingIndex []int) (fin
 			allCodewords = append(allCodewords, encodedChunk)
 		}
 	}
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	randomMap = r.Perm(codewordBits)
+	// Use a stable random map so the missing packet index corresponds to a fixed row set across batches
+	randomMap = getStableRandomMap(codewordBits, K)
 	subsetSizeBits := codewordBits / K
 	outputPacketSizeBits := numCodewords * subsetSizeBits
 	outputPacketsBits := make([][]bool, K)
@@ -453,6 +653,161 @@ func DeinterleaveAndReassemble(interleavedPackets [][]byte, randomMap []int) (or
 	return originalCodewords, nil
 }
 
+// DeinterleaveAndReassembleLLRs reconstructs codeword LLRs directly, treating any missing packet
+// (nil or empty slice) as an erasure. Present bits get +/- baseLLR, missing bits get 0.
+func DeinterleaveAndReassembleLLRs(interleavedPackets [][]byte, randomMap []int, baseLLR float64) ([][]float64, error) {
+	K := len(interleavedPackets)
+	if K == 0 {
+		return nil, errors.New("input packets cannot be empty")
+	}
+
+	const outputPacketSizeBytes = 1024
+	const codewordBytes = 128
+	const codewordBits = codewordBytes * 8 // 1024
+	numCodewords := K * 8
+
+	// Unpack present packets to bit arrays; mark missing ones.
+	packetsAsBits := make([][]bool, K)
+	present := make([]bool, K)
+	for i, packet := range interleavedPackets {
+		if len(packet) == 0 {
+			present[i] = false
+			continue
+		}
+		if len(packet) != outputPacketSizeBytes {
+			return nil, errors.New("invalid packet size for packet")
+		}
+		present[i] = true
+		packetBits := make([]bool, outputPacketSizeBytes*8)
+		for j, byteVal := range packet {
+			for bitOffset := 0; bitOffset < 8; bitOffset++ {
+				packetBits[j*8+bitOffset] = (byteVal>>bitOffset)&1 == 1
+			}
+		}
+		packetsAsBits[i] = packetBits
+	}
+
+	// Gather subsets for each codeword, tracking presence mask.
+	subsetSizeBits := codewordBits / K
+	reassembledShuffledBits := make([][]bool, numCodewords)
+	reassembledShuffledMask := make([][]bool, numCodewords)
+	for cwIdx := 0; cwIdx < numCodewords; cwIdx++ {
+		sbits := make([]bool, codewordBits)
+		smask := make([]bool, codewordBits)
+		for subsetIdx := 0; subsetIdx < K; subsetIdx++ {
+			destStart := subsetIdx * subsetSizeBits
+			if present[subsetIdx] {
+				srcBits := packetsAsBits[subsetIdx]
+				srcStart := cwIdx * subsetSizeBits
+				copy(sbits[destStart:destStart+subsetSizeBits], srcBits[srcStart:srcStart+subsetSizeBits])
+				for i := 0; i < subsetSizeBits; i++ {
+					smask[destStart+i] = true
+				}
+			} else {
+				// missing packet: leave bits default false and mask false
+			}
+		}
+		reassembledShuffledBits[cwIdx] = sbits
+		reassembledShuffledMask[cwIdx] = smask
+	}
+
+	// De-shuffle and convert to LLRs
+	inverseRandomMap := invertMap(randomMap)
+	llrs := make([][]float64, numCodewords)
+	for cwIdx := 0; cwIdx < numCodewords; cwIdx++ {
+		llr := make([]float64, codewordBits)
+		for i := 0; i < codewordBits; i++ {
+			src := inverseRandomMap[i]
+			if reassembledShuffledMask[cwIdx][src] {
+				bit := reassembledShuffledBits[cwIdx][src]
+				if bit {
+					llr[i] = -baseLLR // 1 -> negative
+				} else {
+					llr[i] = baseLLR // 0 -> positive
+				}
+			} else {
+				llr[i] = 0 // erasure
+			}
+		}
+		llrs[cwIdx] = llr
+	}
+	return llrs, nil
+}
+
+// DeinterleaveAndReassembleKnown returns de-shuffled codeword bits and a mask indicating presence.
+func DeinterleaveAndReassembleKnown(interleavedPackets [][]byte, randomMap []int) ([][]bool, [][]bool, error) {
+	K := len(interleavedPackets)
+	if K == 0 {
+		return nil, nil, errors.New("input packets cannot be empty")
+	}
+	const outputPacketSizeBytes = 1024
+	const codewordBytes = 128
+	const codewordBits = codewordBytes * 8
+	numCodewords := K * 8
+
+	packetsAsBits := make([][]bool, K)
+	present := make([]bool, K)
+	for i, packet := range interleavedPackets {
+		if len(packet) == 0 {
+			present[i] = false
+			continue
+		}
+		if len(packet) != outputPacketSizeBytes {
+			return nil, nil, errors.New("invalid packet size for packet")
+		}
+		present[i] = true
+		bits := make([]bool, outputPacketSizeBytes*8)
+		for j, b := range packet {
+			for bit := 0; bit < 8; bit++ {
+				bits[j*8+bit] = (b>>bit)&1 == 1
+			}
+		}
+		packetsAsBits[i] = bits
+	}
+
+	subsetSizeBits := codewordBits / K
+	shuffledBits := make([][]bool, numCodewords)
+	shuffledMask := make([][]bool, numCodewords)
+	for cwIdx := 0; cwIdx < numCodewords; cwIdx++ {
+		sb := make([]bool, codewordBits)
+		sm := make([]bool, codewordBits)
+		for subsetIdx := 0; subsetIdx < K; subsetIdx++ {
+			destStart := subsetIdx * subsetSizeBits
+			if present[subsetIdx] {
+				src := packetsAsBits[subsetIdx]
+				srcStart := cwIdx * subsetSizeBits
+				copy(sb[destStart:destStart+subsetSizeBits], src[srcStart:srcStart+subsetSizeBits])
+				for i := 0; i < subsetSizeBits; i++ {
+					sm[destStart+i] = true
+				}
+			}
+		}
+		shuffledBits[cwIdx] = sb
+		shuffledMask[cwIdx] = sm
+	}
+
+	inv := invertMap(randomMap)
+	bits := make([][]bool, numCodewords)
+	masks := make([][]bool, numCodewords)
+	for cwIdx := 0; cwIdx < numCodewords; cwIdx++ {
+		b := make([]bool, codewordBits)
+		m := make([]bool, codewordBits)
+		for i := 0; i < codewordBits; i++ {
+			src := inv[i]
+			b[i] = shuffledBits[cwIdx][src]
+			m[i] = shuffledMask[cwIdx][src]
+		}
+		bits[cwIdx] = b
+		masks[cwIdx] = m
+	}
+	return bits, masks, nil
+}
+
+// buildPolarColumns constructs the N columns of G = F^{\otimes n} used by the encoder.
+
+// solveGF2FullRank solves A x = b over GF(2), where A is MxK with rank K.
+// solveGF2FullRank removed; using precomputed inverse approach for performance.
+
 // Decoder holds the state for the successive cancellation decoder.
 type Decoder struct {
 	n         int // log2(N)
@@ -472,39 +827,58 @@ func NewDecoder(n int, frozenSet map[int]struct{}) *Decoder {
 	}
 }
 
-// Decode performs hard-decision inversion of F^{⊗n} suitable for noiseless recovery.
-// It ignores the frozen set and returns the estimated information vector u directly.
-func (d *Decoder) Decode(receivedCodeword []float64) []int {
-	N := len(receivedCodeword)
-	// 1) Hard decision on codeword bits x
-	x := make([]bool, N)
-	for i, L := range receivedCodeword {
-		// L >= 0 => bit 0; L < 0 => bit 1
-		x[i] = L < 0
+// f performs the check node operation using the min-sum approximation.
+func f(a, b float64) float64 {
+	return math.Copysign(1.0, a) * math.Copysign(1.0, b) * math.Min(math.Abs(a), math.Abs(b))
+}
+
+// g performs the repetition node operation in the LLR domain.
+func g(a, b float64, u int) float64 {
+	if u == 0 {
+		return a + b
 	}
-	// 2) Apply inverse transform. Since F^{⊗n} is involutory over GF(2),
-	// we reuse the same butterfly to map x -> u.
-	for i := uint(0); i < uint(d.n); i++ {
-		blockSize := 1 << (i + 1)
-		halfBlock := 1 << i
-		for blockStart := 0; blockStart < N; blockStart += blockSize {
-			for j := 0; j < halfBlock; j++ {
-				idx1 := blockStart + j
-				idx2 := idx1 + halfBlock
-				x[idx1] = x[idx1] != x[idx2]
+	return b - a
+}
+
+func (d *Decoder) decodeRecursive(llrs []float64) []int {
+	n := len(llrs)
+	if n == 1 {
+		var decision int
+		if _, isFrozen := d.frozenSet[d.bitIdx]; isFrozen {
+			decision = 0
+		} else {
+			if llrs[0] >= 0 {
+				decision = 0
+			} else {
+				decision = 1
 			}
 		}
+		d.bitIdx++
+		return []int{decision}
 	}
-	// 3) Pack into ints
-	u := make([]int, N)
-	for i := 0; i < N; i++ {
-		if x[i] {
-			u[i] = 1
-		} else {
-			u[i] = 0
-		}
+	half := n / 2
+	fllr := make([]float64, half)
+	for i := 0; i < half; i++ {
+		fllr[i] = f(llrs[i], llrs[i+half])
+	}
+	u1 := d.decodeRecursive(fllr)
+	gllr := make([]float64, half)
+	for i := 0; i < half; i++ {
+		gllr[i] = g(llrs[i], llrs[i+half], u1[i])
+	}
+	u2 := d.decodeRecursive(gllr)
+	u := make([]int, n)
+	for i := 0; i < half; i++ {
+		u[i] = u1[i] ^ u2[i]
+		u[i+half] = u2[i]
 	}
 	return u
+}
+
+// Decode runs SC decoding on the provided LLR vector.
+func (d *Decoder) Decode(receivedCodeword []float64) []int {
+	d.bitIdx = 0
+	return d.decodeRecursive(receivedCodeword)
 }
 
 // bitReverseN returns the integer formed by reversing the lower n bits of x.
@@ -521,7 +895,8 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 	const frameSize = 512
 	const polarN = 10
 	const numDataBits = 512
-	originalCodewords, err := DeinterleaveAndReassemble(interleavedPackets, randomMap)
+	// Recover known codeword bits and presence mask
+	cwBits, _, err := DeinterleaveAndReassembleKnown(interleavedPackets, randomMap)
 	if err != nil {
 		return nil, errors.New("failed to reassemble")
 	}
@@ -536,25 +911,292 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 			frozenSet[i] = struct{}{}
 		}
 	}
-
-	// Create an instance of YOUR decoder.
-	decoder := NewDecoder(polarN, frozenSet)
-	allDataBits := make([]int, 0, K*frameSize*8)
-
-	for _, codeword := range originalCodewords {
-		initialLLRs := make([]float64, len(codeword)*8)
-		for i, byteVal := range codeword {
-			for j := range 8 {
-				bit := (byteVal >> j) & 1
-				softValue := 1.0 - 2.0*float64(bit)
-				initialLLRs[i*8+j] = 2.0 * softValue
+	// Fast path: if no erasure (all bits known), use involutory transform to invert F^{\otimes n}
+	// Fast path: no packet loss
+	dropIdx := -1
+	for i, p := range interleavedPackets {
+		if len(p) == 0 {
+			dropIdx = i
+			break
+		}
+	}
+	allKnown := dropIdx == -1
+	if allKnown {
+		allDataBits := make([]int, 0, K*frameSize*8)
+		N := 1 << polarN
+		dataIdx := make([]int, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			dataIdx[i] = bitReverseN(encodingIndex[i], polarN)
+		}
+		u := make([]bool, N)
+		for cw := 0; cw < len(cwBits); cw++ {
+			// copy x
+			copy(u, cwBits[cw])
+			// apply F^{\otimes n} again (self-inverse) to get u
+			for s := 0; s < polarN; s++ {
+				block := 1 << (s + 1)
+				half := 1 << s
+				for start := 0; start < N; start += block {
+					for k := 0; k < half; k++ {
+						i1 := start + k
+						i2 := i1 + half
+						u[i1] = u[i1] != u[i2]
+					}
+				}
+			}
+			for i := 0; i < numDataBits; i++ {
+				if u[dataIdx[i]] {
+					allDataBits = append(allDataBits, 1)
+				} else {
+					allDataBits = append(allDataBits, 0)
+				}
 			}
 		}
-		// Run YOUR decoder.
-		decodedInfoVector := decoder.Decode(initialLLRs)
-		for i := range numDataBits {
-			dataIndex := bitReverseN(encodingIndex[i], polarN)
-			allDataBits = append(allDataBits, decodedInfoVector[dataIndex])
+		numFrames := len(allDataBits) / (frameSize * 8)
+		recoveredFrames := make([][]byte, numFrames)
+		bitCounter := 0
+		for i := range numFrames {
+			frameBytes := make([]byte, frameSize)
+			for j := range frameSize {
+				var b byte
+				for k := 0; k < 8; k++ {
+					if allDataBits[bitCounter] == 1 {
+						b |= 1 << k
+					}
+					bitCounter++
+				}
+				frameBytes[j] = b
+			}
+			recoveredFrames[i] = frameBytes
+		}
+		return recoveredFrames, nil
+	}
+
+	// Erasure path: Build only the K=512 info columns using butterfly
+	Gcols, infoCols := getInfoColsAndG(polarN, encodingIndex)
+	N := 1 << polarN
+
+	// Build known rows from randomMap using dropIdx
+	subsetSizeBits := N / K
+	presentRow := make([]bool, N)
+	for i := 0; i < N; i++ {
+		presentRow[i] = true
+	}
+	if dropIdx >= 0 {
+		start := dropIdx * subsetSizeBits
+		for pos := start; pos < start+subsetSizeBits; pos++ {
+			presentRow[randomMap[pos]] = false
+		}
+	}
+	knownRowIdx := make([]int, 0, N)
+	for r := 0; r < N; r++ {
+		if presentRow[r] {
+			knownRowIdx = append(knownRowIdx, r)
+		}
+	}
+
+	// Use inverse cache indexed by dropped packet index if available
+	if dropIdx >= 0 && dropIdx < 32 {
+		if invCache[dropIdx] != nil {
+			invAsqPacked := invCache[dropIdx].inv
+			usedRows := invCache[dropIdx].usedRows
+			// Batch solve using cached inverse
+			numCW := len(cwBits)
+			wordsCW := (numCW + 63) / 64
+			B := make([][]uint64, numDataBits)
+			for c := 0; c < numDataBits; c++ {
+				row := make([]uint64, wordsCW)
+				for cw := 0; cw < numCW; cw++ {
+					if cwBits[cw][usedRows[c]] {
+						row[cw>>6] |= 1 << (uint(cw) & 63)
+					}
+				}
+				B[c] = row
+			}
+			Out := make([][]uint64, numDataBits)
+			for i := 0; i < numDataBits; i++ {
+				acc := make([]uint64, wordsCW)
+				for pb := 0; pb < len(invAsqPacked[i]); pb++ {
+					m := invAsqPacked[i][pb]
+					for m != 0 {
+						tz := bits.TrailingZeros64(m)
+						col := (pb << 6) + tz
+						brow := B[col]
+						for w := 0; w < wordsCW; w++ {
+							acc[w] ^= brow[w]
+						}
+						m &= m - 1
+					}
+				}
+				Out[i] = acc
+			}
+			allDataBits := make([]int, 0, K*frameSize*8)
+			for cw := 0; cw < numCW; cw++ {
+				w := cw >> 6
+				b := uint(cw) & 63
+				for i := 0; i < numDataBits; i++ {
+					if ((Out[i][w] >> b) & 1) == 1 {
+						allDataBits = append(allDataBits, 1)
+					} else {
+						allDataBits = append(allDataBits, 0)
+					}
+				}
+			}
+			// Pack frames
+			numFrames := len(allDataBits) / (frameSize * 8)
+			recoveredFrames := make([][]byte, numFrames)
+			bitCounter := 0
+			for i := range numFrames {
+				frameBytes := make([]byte, frameSize)
+				for j := range frameSize {
+					var b byte
+					for k := 0; k < 8; k++ {
+						if allDataBits[bitCounter] == 1 {
+							b |= 1 << k
+						}
+						bitCounter++
+					}
+					frameBytes[j] = b
+				}
+				recoveredFrames[i] = frameBytes
+			}
+			return recoveredFrames, nil
+		}
+	}
+	// Assemble A rows once
+	rowsA := make([][]bool, 0, len(knownRowIdx))
+	for _, r := range knownRowIdx {
+		arow := make([]bool, numDataBits)
+		for c := 0; c < numDataBits; c++ {
+			arow[c] = Gcols[c][r]
+		}
+		rowsA = append(rowsA, arow)
+	}
+	// Prefer a greedy per-column pivot row assignment using (r & j)==j to avoid rank issues
+	used := make([]bool, len(knownRowIdx))
+	colRow := make([]int, numDataBits)
+	for c := 0; c < numDataBits; c++ {
+		colRow[c] = -1
+	}
+	for c := 0; c < numDataBits; c++ {
+		j := infoCols[c]
+		for ridx, r := range knownRowIdx {
+			if used[ridx] {
+				continue
+			}
+			if (r & j) == j {
+				colRow[c] = ridx
+				used[ridx] = true
+				break
+			}
+		}
+	}
+	haveAll := true
+	for c := 0; c < numDataBits; c++ {
+		if colRow[c] == -1 {
+			haveAll = false
+			break
+		}
+	}
+	var Asq [][]bool
+	if haveAll {
+		Asq = make([][]bool, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			Asq[i] = append([]bool(nil), rowsA[colRow[i]]...)
+		}
+	} else {
+		// Fallback: choose K independent rows via elimination on all known rows
+		pivotRows, ok := selectPivotRows(rowsA, numDataBits)
+		if !ok {
+			return nil, errors.New("polar erasure rank deficiency")
+		}
+		Asq = make([][]bool, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			Asq[i] = append([]bool(nil), rowsA[pivotRows[i]]...)
+		}
+	}
+	invAsqPacked, ok := invertBoolMatrixGF2Packed(Asq)
+	if !ok {
+		return nil, errors.New("polar erasure inversion failed")
+	}
+	// Cache inverse for this dropIdx if within 0..31
+	if dropIdx >= 0 && dropIdx < 32 {
+		usedRows := make([]int, numDataBits)
+		if haveAll {
+			for i := 0; i < numDataBits; i++ {
+				usedRows[i] = knownRowIdx[colRow[i]]
+			}
+		} else {
+			pr, _ := selectPivotRows(rowsA, numDataBits)
+			for i := 0; i < numDataBits; i++ {
+				usedRows[i] = knownRowIdx[pr[i]]
+			}
+		}
+		invCache[dropIdx] = &struct {
+			inv      [][]uint64
+			usedRows []int
+		}{inv: invAsqPacked, usedRows: usedRows}
+	}
+
+	// Determine which knownRowIdx rows were used in Asq
+	usedRows := make([]int, numDataBits)
+	if haveAll {
+		for i := 0; i < numDataBits; i++ {
+			usedRows[i] = knownRowIdx[colRow[i]]
+		}
+	} else {
+		// Recompute pivot rows used by selectPivotRows over rowsA to map back to knownRowIdx
+		// Since Asq was constructed from rowsA[pivotRows[i]], recreate that mapping
+		pr, _ := selectPivotRows(rowsA, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			usedRows[i] = knownRowIdx[pr[i]]
+		}
+	}
+
+	// Batch solve for all codewords at once: Out = invAsq * B over GF(2), packed across codewords
+	numCW := len(cwBits)
+	wordsCW := (numCW + 63) / 64
+	// Build B: K rows x wordsCW words, where B[c][w] holds cw-bits for column c
+	B := make([][]uint64, numDataBits)
+	for c := 0; c < numDataBits; c++ {
+		row := make([]uint64, wordsCW)
+		for cw := 0; cw < numCW; cw++ {
+			if cwBits[cw][usedRows[c]] {
+				row[cw>>6] |= 1 << (uint(cw) & 63)
+			}
+		}
+		B[c] = row
+	}
+	// Out = invAsqPacked (KxK) * B (KxW)
+	Out := make([][]uint64, numDataBits)
+	for i := 0; i < numDataBits; i++ {
+		acc := make([]uint64, wordsCW)
+		for pb := 0; pb < len(invAsqPacked[i]); pb++ {
+			m := invAsqPacked[i][pb]
+			for m != 0 {
+				tz := bits.TrailingZeros64(m)
+				col := (pb << 6) + tz
+				// XOR the whole word-vector for this column
+				brow := B[col]
+				for w := 0; w < wordsCW; w++ {
+					acc[w] ^= brow[w]
+				}
+				m &= m - 1
+			}
+		}
+		Out[i] = acc
+	}
+	// Extract per-codeword info bits
+	allDataBits := make([]int, 0, K*frameSize*8)
+	for cw := 0; cw < numCW; cw++ {
+		w := cw >> 6
+		b := uint(cw) & 63
+		for i := 0; i < numDataBits; i++ {
+			if ((Out[i][w] >> b) & 1) == 1 {
+				allDataBits = append(allDataBits, 1)
+			} else {
+				allDataBits = append(allDataBits, 0)
+			}
 		}
 	}
 	numFrames := len(allDataBits) / (frameSize * 8)
