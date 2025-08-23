@@ -2,9 +2,10 @@ package fec
 
 import (
 	"bytes"
-	"crypto/rand"
 	"fmt"
+	"math/rand"
 	"testing"
+	"time"
 
 	// quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/fec"
@@ -71,7 +72,7 @@ func TestPolar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Critical error: Could not load encoding_index.bin. Please ensure the file exists. %v", err)
 	}
-
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	// --- Setup ---
 	K := 32 // Number of data frames
 	const frameSize = 512
@@ -83,7 +84,7 @@ func TestPolar(t *testing.T) {
 	originalDataFrames := make([][]byte, K)
 	for i := 0; i < K; i++ {
 		originalDataFrames[i] = make([]byte, frameSize)
-		_, err := rand.Read(originalDataFrames[i])
+		_, err := r.Read(originalDataFrames[i])
 		if err != nil {
 			t.Fatalf("Failed to generate random frame %d: %v", i, err)
 		}

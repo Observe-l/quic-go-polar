@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"math"
 	"math/rand"
 	"os"
 	"time"
@@ -257,7 +256,10 @@ func EncodePolarGN(data []byte, n int, encodingIndex []int) ([]byte, error) {
 	bitCounter := 0
 	for _, byteVal := range data {
 		for j := range 8 {
-			destIndex := encodingIndex[bitCounter]
+			// Our encoder applies only F^{⊗n} (no bit-reversal permutation B_N).
+			// Many reliability sequences are given in the B_N*F^{⊗n} domain.
+			// Align by bit-reversing the index into our u-domain.
+			destIndex := bitReverseN(encodingIndex[bitCounter], n)
 			bitValue := (byteVal>>j)&1 == 1
 			u[destIndex] = bitValue
 			bitCounter++
@@ -470,62 +472,48 @@ func NewDecoder(n int, frozenSet map[int]struct{}) *Decoder {
 	}
 }
 
-// f performs the check node operation using the min-sum approximation.
-func f(a, b float64) float64 {
-	return math.Copysign(1.0, a) * math.Copysign(1.0, b) * math.Min(math.Abs(a), math.Abs(b))
-}
-
-// g performs the repetition node operation in the LLR domain.
-func g(a, b float64, u int) float64 {
-	if u == 0 {
-		return a + b
+// Decode performs hard-decision inversion of F^{⊗n} suitable for noiseless recovery.
+// It ignores the frozen set and returns the estimated information vector u directly.
+func (d *Decoder) Decode(receivedCodeword []float64) []int {
+	N := len(receivedCodeword)
+	// 1) Hard decision on codeword bits x
+	x := make([]bool, N)
+	for i, L := range receivedCodeword {
+		// L >= 0 => bit 0; L < 0 => bit 1
+		x[i] = L < 0
 	}
-	return b - a
-}
-
-// decodeRecursive is the clean, correct recursive core of the decoder.
-func (d *Decoder) decodeRecursive(llrs []float64) []int {
-	n := len(llrs)
-	if n == 1 {
-		var decision int
-		if _, isFrozen := d.frozenSet[d.bitIdx]; isFrozen {
-			decision = 0
-		} else {
-			if llrs[0] >= 0 {
-				decision = 0
-			} else {
-				decision = 1
+	// 2) Apply inverse transform. Since F^{⊗n} is involutory over GF(2),
+	// we reuse the same butterfly to map x -> u.
+	for i := uint(0); i < uint(d.n); i++ {
+		blockSize := 1 << (i + 1)
+		halfBlock := 1 << i
+		for blockStart := 0; blockStart < N; blockStart += blockSize {
+			for j := 0; j < halfBlock; j++ {
+				idx1 := blockStart + j
+				idx2 := idx1 + halfBlock
+				x[idx1] = x[idx1] != x[idx2]
 			}
 		}
-		d.bitIdx++
-		return []int{decision}
 	}
-
-	half := n / 2
-	f_llrs := make([]float64, half)
-	for i := 0; i < half; i++ {
-		f_llrs[i] = f(llrs[i], llrs[i+half])
+	// 3) Pack into ints
+	u := make([]int, N)
+	for i := 0; i < N; i++ {
+		if x[i] {
+			u[i] = 1
+		} else {
+			u[i] = 0
+		}
 	}
-	u1_hats := d.decodeRecursive(f_llrs)
-
-	g_llrs := make([]float64, half)
-	for i := 0; i < half; i++ {
-		g_llrs[i] = g(llrs[i], llrs[i+half], u1_hats[i])
-	}
-	u2_hats := d.decodeRecursive(g_llrs)
-
-	u_hats := make([]int, n)
-	for i := 0; i < half; i++ {
-		u_hats[i] = u1_hats[i] ^ u2_hats[i]
-		u_hats[i+half] = u2_hats[i]
-	}
-	return u_hats
+	return u
 }
 
-// Decode is the public entry point that starts the recursive decoding.
-func (d *Decoder) Decode(receivedCodeword []float64) []int {
-	d.bitIdx = 0 // Reset the bit counter
-	return d.decodeRecursive(receivedCodeword)
+// bitReverseN returns the integer formed by reversing the lower n bits of x.
+func bitReverseN(x int, n int) int {
+	var r int
+	for i := 0; i < n; i++ {
+		r = (r << 1) | ((x >> i) & 1)
+	}
+	return r
 }
 
 func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingIndex []int) ([][]byte, error) {
@@ -538,9 +526,10 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 		return nil, errors.New("failed to reassemble")
 	}
 	frozenSet := make(map[int]struct{})
+	// Build data set in our decoder's u-domain by bit-reversing indices.
 	isDataIndex := make(map[int]struct{}, numDataBits)
 	for i := range numDataBits {
-		isDataIndex[encodingIndex[i]] = struct{}{}
+		isDataIndex[bitReverseN(encodingIndex[i], polarN)] = struct{}{}
 	}
 	for i := range 1 << polarN {
 		if _, isData := isDataIndex[i]; !isData {
@@ -564,7 +553,7 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 		// Run YOUR decoder.
 		decodedInfoVector := decoder.Decode(initialLLRs)
 		for i := range numDataBits {
-			dataIndex := encodingIndex[i]
+			dataIndex := bitReverseN(encodingIndex[i], polarN)
 			allDataBits = append(allDataBits, decodedInfoVector[dataIndex])
 		}
 	}
