@@ -1,12 +1,13 @@
 package fec
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
-	"math/bits"
+	"math"
 	"math/rand"
+	"os"
 	"time"
-
-	"gonum.org/v1/gonum/mat"
 )
 
 // --- Polar (structured GF(2) linear code) --- //
@@ -208,10 +209,32 @@ func matVecGF2(A [][]bool, x []bool) []bool {
 	return y
 }
 
-// bitReverse reverses the 'n' least significant bits of an integer 'i'.
-func bitReverse(i, n uint) uint {
-	// bits.Reverse reverses all bits, so we shift to keep only the 'n' we care about.
-	return bits.Reverse(i) >> (bits.UintSize - n)
+// LoadEncodingIndex reads a binary file containing a sequence of little-endian int64 values
+// and converts them to a slice of int for use as array indices.
+func LoadEncodingIndex(filePath string) ([]int, error) {
+	fileBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, errors.New("failed to read encoding index file")
+	}
+
+	int64Size := 8
+	if len(fileBytes)%int64Size != 0 {
+		return nil, errors.New("file size is not a multiple of int64 size")
+	}
+
+	arrayLen := len(fileBytes) / int64Size
+	goSlice64 := make([]int64, arrayLen)
+	reader := bytes.NewReader(fileBytes)
+	if err := binary.Read(reader, binary.LittleEndian, &goSlice64); err != nil {
+		return nil, errors.New("failed to decode binary data")
+	}
+
+	// Convert []int64 to []int for direct use as slice indices.
+	goSliceInt := make([]int, arrayLen)
+	for i, v := range goSlice64 {
+		goSliceInt[i] = int(v)
+	}
+	return goSliceInt, nil
 }
 
 // EncodePolarGN encodes the input data using the standard polar generator matrix G_N = B_N * F^{⊗n}.
@@ -223,256 +246,64 @@ func bitReverse(i, n uint) uint {
 // Returns:
 //   - A byte slice containing the encoded codeword of length N/8.
 //   - An error if the input parameters are invalid.
-func EncodePolarGN(data []byte, n int) ([]byte, error) {
-	if n <= 0 {
-		return nil, errors.New("n must be a positive integer")
+func EncodePolarGN(data []byte, n int, encodingIndex []int) ([]byte, error) {
+	dataBits := len(data) * 8
+	N := 1 << n
+	if len(encodingIndex) < dataBits {
+		return nil, errors.New("encoding index length error")
 	}
-
-	N := 1 << n        // N = 2^n, the total length of the codeword in bits.
-	K := len(data) * 8 // K is the length of the message data in bits.
-
-	if K > N {
-		return nil, errors.New("data length cannot be greater than codeword length N")
-	}
-
-	// The encoding is x = u * G_N = u * (B_N * F^{⊗n}) = (u * B_N) * F^{⊗n}.
-	// We implement this efficiently in three steps.
-
-	// 1. Construct the initial information vector 'u' of length N.
-	// This vector contains the message bits followed by frozen bits (zeros).
+	// Create the information vector 'u' using the reliability sequence.
 	u := make([]bool, N)
-	for i := 0; i < len(data); i++ {
-		byteVal := data[i]
-		for j := 0; j < 8; j++ {
-			// Extract the j-th bit from the byte.
-			if (byteVal>>j)&1 == 1 {
-				u[i*8+j] = true
-			}
+	bitCounter := 0
+	for _, byteVal := range data {
+		for j := range 8 {
+			destIndex := encodingIndex[bitCounter]
+			bitValue := (byteVal>>j)&1 == 1
+			u[destIndex] = bitValue
+			bitCounter++
 		}
 	}
-	// The rest of the 'u' slice remains false (frozen bits).
-
-	// 2. Permute 'u' using bit-reversal to get u_permuted = u * B_N.
-	// This is the most efficient way to apply the B_N matrix.
-	uPermuted := make([]bool, N)
-	for i := 0; i < N; i++ {
-		reversedIndex := bitReverse(uint(i), uint(n))
-		uPermuted[i] = u[reversedIndex]
-	}
-
-	// 3. Encode u_permuted using the fast F^{⊗n} transform to get the final codeword x.
-	// This calculates x = u_permuted * F^{⊗n}.
-	x := uPermuted // Work in-place on the permuted vector for efficiency.
-	for i := 0; i < n; i++ {
-		stage := uint(i)
-		blockSize := 1 << (stage + 1)
-		halfBlock := 1 << stage
-
-		for blockStart := 0; blockStart < N; blockStart += blockSize {
-			for j := 0; j < halfBlock; j++ {
-				idx1 := blockStart + j
-				idx2 := idx1 + halfBlock
-
-				// Apply the core transformation: (a, b) -> (a XOR b, b)
-				// The boolean '!=' operator is equivalent to XOR.
-				x[idx1] = x[idx1] != x[idx2]
-			}
-		}
-	}
-	// The vector 'x' now holds the correctly encoded codeword.
-
-	// 4. Pack the resulting boolean slice back into a byte slice.
-	encodedBytes := make([]byte, N/8)
-	for i := 0; i < len(encodedBytes); i++ {
-		var packedByte byte
-		for j := 0; j < 8; j++ {
-			bitIndex := i*8 + j
-			if x[bitIndex] {
-				// Set the j-th bit of the byte.
-				packedByte |= (1 << j)
-			}
-		}
-		encodedBytes[i] = packedByte
-	}
-
-	return encodedBytes, nil
-}
-
-// PolarGeneratorMatrix creates the N x N polar code generator matrix G_N, where N = 2^n.
-// This is the standard definition G_N = B_N * (F ⊗ n), where B_N is the
-// bit-reversal permutation matrix and F = [[1, 0], [1, 1]].
-func PolarGeneratorMatrix(n int) *mat.Dense {
-	N := 1 << n // N = 2^n
-
-	// 1. Efficiently compute F_kron_n = F^{\otimes n} using boolean logic.
-	// This is adapted from the efficient generator you provided.
-	fKronN := [][]bool{{true}}
-	for i := 0; i < n; i++ {
-		prevSize := 1 << i
-		// Create the new, larger matrix (twice the dimensions)
-		newFKronN := make([][]bool, 2*prevSize)
-		for r := range newFKronN {
-			newFKronN[r] = make([]bool, 2*prevSize)
-		}
-
-		// Fill the new matrix based on the definition of the Kronecker product with F.
-		for r := 0; r < prevSize; r++ {
-			for c := 0; c < prevSize; c++ {
-				// F = [[1, 0], [1, 1]]
-				// Top-left block (1 * G)
-				newFKronN[r][c] = fKronN[r][c]
-				// Top-right block (0 * G) -> already false from initialization
-				// Bottom-left block (1 * G)
-				newFKronN[r+prevSize][c] = fKronN[r][c]
-				// Bottom-right block (1 * G)
-				newFKronN[r+prevSize][c+prevSize] = fKronN[r][c]
-			}
-		}
-		fKronN = newFKronN
-	}
-
-	// 2. Generate the bit-reversal permutation order for the columns.
-	permutation := make([]int, N)
-	for i := 0; i < N; i++ {
-		permutation[i] = int(bitReverse(uint(i), uint(n)))
-	}
-
-	// 3. Apply the permutation and convert the boolean matrix to a *mat.Dense (float64).
-	// The final matrix is initialized with all zeros.
-	gN := mat.NewDense(N, N, nil)
-
-	// The k-th column of the final matrix should be the permutation[k]-th column of fKronN.
-	for r := 0; r < N; r++ {
-		for c := 0; c < N; c++ {
-			// Get the value from the un-permuted matrix
-			val := fKronN[r][c]
-			if val {
-				// Place it in the permuted column location
-				permutedCol := permutation[c]
-				gN.Set(r, permutedCol, 1.0)
-			}
-		}
-	}
-
-	return gN
-}
-
-// EncodePacketsBitLevelFEC encodes a set of data packets by treating them as a single
-// contiguous bitstream, applying a polar code, and re-segmenting the output.
-// This is a high-efficiency implementation.
-//
-// Parameters:
-//   - dataPackets: A slice of K data packets.
-//   - R: The number of zero-padding packets to append before encoding.
-//
-// Returns:
-//   - A slice of K+R encoded packets.
-//   - An error if the input is invalid.
-func EncodePacketsBitLevelFEC(dataPackets [][]byte, R int) ([][]byte, error) {
-	K := len(dataPackets)
-	if K == 0 {
-		return nil, errors.New("input dataPackets cannot be empty")
-	}
-	if R < 0 {
-		return nil, errors.New("number of redundancy packets (R) cannot be negative")
-	}
-	packetSize := len(dataPackets[0])
-	totalPackets := K + R
-
-	// --- 1. Concatenate all packets into a single flat byte slice ---
-	totalBytes := totalPackets * packetSize
-	flatUBytes := make([]byte, totalBytes)
-
-	for i := 0; i < K; i++ {
-		if len(dataPackets[i]) != packetSize {
-			return nil, errors.New("all data packets must have the same length")
-		}
-		offset := i * packetSize
-		copy(flatUBytes[offset:offset+packetSize], dataPackets[i])
-	}
-	// The remaining bytes in flatUBytes (from K*packetSize to the end) are already zero,
-	// representing the R padding packets.
-
-	// --- 2. Unpack the entire flat byte slice into a bit-level information vector 'u' ---
-	N := totalBytes * 8
-	if N == 0 || (N&(N-1)) != 0 {
-		return nil, errors.New("total number of bits must be a power of 2")
-	}
-	n := uint(bits.TrailingZeros(uint(N)))
-
-	u := make([]bool, N)
-	for i, byteVal := range flatUBytes {
-		for j := 0; j < 8; j++ {
-			if (byteVal>>j)&1 == 1 {
-				u[i*8+j] = true
-			}
-		}
-	}
-
-	// --- 3. Perform the standard bit-level Polar Encode (G_N = B_N * F^{⊗n}) ---
-	// a) Apply Bit-Reversal Permutation
-	uPermuted := make([]bool, N)
-	for i := 0; i < N; i++ {
-		reversedIndex := bitReverse(uint(i), n)
-		uPermuted[i] = u[reversedIndex]
-	}
-
-	// b) Apply Fast Polar Transform
-	x := uPermuted // Work in-place
-	for i := uint(0); i < n; i++ {
+	// We apply the transform directly to the information vector 'u'.
+	x := u
+	for i := uint(0); i < uint(n); i++ {
 		blockSize := 1 << (i + 1)
 		halfBlock := 1 << i
 		for blockStart := 0; blockStart < N; blockStart += blockSize {
 			for j := 0; j < halfBlock; j++ {
 				idx1 := blockStart + j
 				idx2 := idx1 + halfBlock
-				x[idx1] = x[idx1] != x[idx2] // XOR
+				x[idx1] = x[idx1] != x[idx2]
 			}
 		}
 	}
-
-	// --- 4. Pack the encoded bit vector 'x' back into a flat byte slice ---
-	encodedFlatBytes := make([]byte, totalBytes)
-	for i := 0; i < totalBytes; i++ {
+	// Pack the bits into bytes.
+	encodedBytes := make([]byte, N/8)
+	for i := range encodedBytes {
 		var packedByte byte
-		for j := 0; j < 8; j++ {
+		for j := range 8 {
 			if x[i*8+j] {
 				packedByte |= (1 << j)
 			}
 		}
-		encodedFlatBytes[i] = packedByte
+		encodedBytes[i] = packedByte
 	}
-
-	// --- 5. Split the flat encoded slice back into packets ---
-	// This is highly efficient as it creates slices that point to the
-	// underlying array without copying memory.
-	outputPackets := make([][]byte, totalPackets)
-	for i := 0; i < totalPackets; i++ {
-		start := i * packetSize
-		end := start + packetSize
-		outputPackets[i] = encodedFlatBytes[start:end]
-	}
-
-	return outputPackets, nil
+	return encodedBytes, nil
 }
 
 // --- Main Pipeline Function with Bit-Level Shuffling ---
 
 // EncodeAndBitInterleaveFrames performs segmentation, polar encoding, and bit-level interleaving.
-func EncodeAndBitInterleaveFrames(dataFrames [][]byte) (finalPackets [][]byte, randomMap []int, allCodewordsForVerification [][]byte, err error) {
+func EncodeAndBitInterleaveFrames(dataFrames [][]byte, encodingIndex []int) (finalPackets [][]byte, randomMap []int, allCodewordsForVerification [][]byte, err error) {
 	K := len(dataFrames)
 	if K == 0 || (K&(K-1)) != 0 {
-		return nil, nil, nil, errors.New("number of data frames (K) must be a non-zero power of 2")
+		return nil, nil, nil, errors.New("k must be a non-zero power of 2")
 	}
-
 	const frameSize = 512
 	const chunkSize = 64
 	const codewordBytes = 128
-	const codewordBits = codewordBytes * 8 // 1024
+	const codewordBits = codewordBytes * 8
 	const chunksPerFrame = frameSize / chunkSize
 	const polarN = 10
-
-	// --- 1. Segmentation and Encoding ---
 	numCodewords := K * chunksPerFrame
 	allCodewords := make([][]byte, 0, numCodewords)
 	for _, frame := range dataFrames {
@@ -481,62 +312,40 @@ func EncodeAndBitInterleaveFrames(dataFrames [][]byte) (finalPackets [][]byte, r
 		}
 		for i := 0; i < chunksPerFrame; i++ {
 			chunk := frame[i*chunkSize : (i+1)*chunkSize]
-			encodedChunk, err := EncodePolarGN(chunk, polarN)
+			encodedChunk, err := EncodePolarGN(chunk, polarN, encodingIndex)
 			if err != nil {
-				return nil, nil, nil, errors.New("failed to encode chunk")
+				return nil, nil, nil, errors.New("encoding failed")
 			}
 			allCodewords = append(allCodewords, encodedChunk)
 		}
 	}
-
-	// --- 2. Generate ONE Shared Random Map for Intra-Codeword Shuffling ---
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	randomMap = r.Perm(codewordBits)
-
-	// --- 3. Shuffle Bits Within Each Codeword and Distribute Subsets ---
 	subsetSizeBits := codewordBits / K
-	if codewordBits%K != 0 {
-		return nil, nil, nil, errors.New("codeword bit length must be divisible by K")
-	}
-
-	// Pre-allocate final packets at the bit-level for efficiency
-	outputPacketSizeBits := numCodewords * subsetSizeBits // (K*8) * (1024/K) = 8192 bits = 1024 bytes
+	outputPacketSizeBits := numCodewords * subsetSizeBits
 	outputPacketsBits := make([][]bool, K)
 	for i := range outputPacketsBits {
 		outputPacketsBits[i] = make([]bool, outputPacketSizeBits)
 	}
-
 	codewordBitsUnpacked := make([]bool, codewordBits)
 	shuffledBits := make([]bool, codewordBits)
-
-	// For each codeword...
 	for cwIdx, codewordBytes := range allCodewords {
-		// a) Unpack the current codeword to bits
 		for i, byteVal := range codewordBytes {
 			for j := 0; j < 8; j++ {
 				codewordBitsUnpacked[i*8+j] = (byteVal>>j)&1 == 1
 			}
 		}
-
-		// b) Shuffle its bits using the shared map
 		for i := 0; i < codewordBits; i++ {
 			shuffledBits[i] = codewordBitsUnpacked[randomMap[i]]
 		}
-
-		// c) Distribute its subsets to the final packets
 		for subsetIdx := 0; subsetIdx < K; subsetIdx++ {
-			// Source: The subset from the shuffled bits
 			subsetStart := subsetIdx * subsetSizeBits
 			subset := shuffledBits[subsetStart : subsetStart+subsetSizeBits]
-
-			// Destination: The correct slot in the target packet's bitstream
 			destPacketBits := outputPacketsBits[subsetIdx]
 			destStartOffset := cwIdx * subsetSizeBits
 			copy(destPacketBits[destStartOffset:], subset)
 		}
 	}
-
-	// --- 4. Pack the Final Bit-Level Packets into Bytes ---
 	finalPackets = make([][]byte, K)
 	outputPacketSizeBytes := outputPacketSizeBits / 8
 	for i := 0; i < K; i++ {
@@ -552,7 +361,6 @@ func EncodeAndBitInterleaveFrames(dataFrames [][]byte) (finalPackets [][]byte, r
 		}
 		finalPackets[i] = packetBytes
 	}
-
 	return finalPackets, randomMap, allCodewords, nil
 }
 
@@ -587,7 +395,7 @@ func DeinterleaveAndReassemble(interleavedPackets [][]byte, randomMap []int) (or
 		}
 		packetBits := make([]bool, outputPacketSizeBytes*8)
 		for j, byteVal := range packet {
-			for bitOffset := 0; bitOffset < 8; bitOffset++ {
+			for bitOffset := range 8 {
 				packetBits[j*8+bitOffset] = (byteVal>>bitOffset)&1 == 1
 			}
 		}
@@ -599,10 +407,10 @@ func DeinterleaveAndReassemble(interleavedPackets [][]byte, randomMap []int) (or
 	reassembledShuffledCodewordsBits := make([][]bool, numCodewords)
 
 	// For each codeword we want to rebuild...
-	for cwIdx := 0; cwIdx < numCodewords; cwIdx++ {
+	for cwIdx := range numCodewords {
 		shuffledCodeword := make([]bool, codewordBits)
 		// ...gather its subsets from every packet.
-		for subsetIdx := 0; subsetIdx < K; subsetIdx++ {
+		for subsetIdx := range K {
 			// Source: The correct chunk from the packet's bitstream
 			sourcePacketBits := packetsAsBits[subsetIdx]
 			sourceStartOffset := cwIdx * subsetSizeBits
@@ -622,15 +430,15 @@ func DeinterleaveAndReassemble(interleavedPackets [][]byte, randomMap []int) (or
 
 	for cwIdx, shuffledBits := range reassembledShuffledCodewordsBits {
 		// a) De-shuffle using the inverse map
-		for i := 0; i < codewordBits; i++ {
+		for i := range codewordBits {
 			deShuffledBits[i] = shuffledBits[inverseRandomMap[i]]
 		}
 
 		// b) Pack the de-shuffled bits back into a byte slice
 		codewordBytesResult := make([]byte, codewordBytes)
-		for i := 0; i < codewordBytes; i++ {
+		for i := range codewordBytes {
 			var packedByte byte
-			for bitOffset := 0; bitOffset < 8; bitOffset++ {
+			for bitOffset := range 8 {
 				if deShuffledBits[i*8+bitOffset] {
 					packedByte |= (1 << bitOffset)
 				}
@@ -641,4 +449,141 @@ func DeinterleaveAndReassemble(interleavedPackets [][]byte, randomMap []int) (or
 	}
 
 	return originalCodewords, nil
+}
+
+// Decoder holds the state for the successive cancellation decoder.
+type Decoder struct {
+	n         int // log2(N)
+	codewordN int // N
+	frozenSet map[int]struct{}
+	bitIdx    int // Tracks the current global bit index being decoded
+}
+
+// NewDecoder initializes a new Decoder.
+func NewDecoder(n int, frozenSet map[int]struct{}) *Decoder {
+	codewordN := 1 << n
+	return &Decoder{
+		n:         n,
+		codewordN: codewordN,
+		frozenSet: frozenSet,
+		bitIdx:    0,
+	}
+}
+
+// f performs the check node operation using the min-sum approximation.
+func f(a, b float64) float64 {
+	return math.Copysign(1.0, a) * math.Copysign(1.0, b) * math.Min(math.Abs(a), math.Abs(b))
+}
+
+// g performs the repetition node operation in the LLR domain.
+func g(a, b float64, u int) float64 {
+	if u == 0 {
+		return a + b
+	}
+	return b - a
+}
+
+// decodeRecursive is the clean, correct recursive core of the decoder.
+func (d *Decoder) decodeRecursive(llrs []float64) []int {
+	n := len(llrs)
+	if n == 1 {
+		var decision int
+		if _, isFrozen := d.frozenSet[d.bitIdx]; isFrozen {
+			decision = 0
+		} else {
+			if llrs[0] >= 0 {
+				decision = 0
+			} else {
+				decision = 1
+			}
+		}
+		d.bitIdx++
+		return []int{decision}
+	}
+
+	half := n / 2
+	f_llrs := make([]float64, half)
+	for i := 0; i < half; i++ {
+		f_llrs[i] = f(llrs[i], llrs[i+half])
+	}
+	u1_hats := d.decodeRecursive(f_llrs)
+
+	g_llrs := make([]float64, half)
+	for i := 0; i < half; i++ {
+		g_llrs[i] = g(llrs[i], llrs[i+half], u1_hats[i])
+	}
+	u2_hats := d.decodeRecursive(g_llrs)
+
+	u_hats := make([]int, n)
+	for i := 0; i < half; i++ {
+		u_hats[i] = u1_hats[i] ^ u2_hats[i]
+		u_hats[i+half] = u2_hats[i]
+	}
+	return u_hats
+}
+
+// Decode is the public entry point that starts the recursive decoding.
+func (d *Decoder) Decode(receivedCodeword []float64) []int {
+	d.bitIdx = 0 // Reset the bit counter
+	return d.decodeRecursive(receivedCodeword)
+}
+
+func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingIndex []int) ([][]byte, error) {
+	K := len(interleavedPackets)
+	const frameSize = 512
+	const polarN = 10
+	const numDataBits = 512
+	originalCodewords, err := DeinterleaveAndReassemble(interleavedPackets, randomMap)
+	if err != nil {
+		return nil, errors.New("failed to reassemble")
+	}
+	frozenSet := make(map[int]struct{})
+	isDataIndex := make(map[int]struct{}, numDataBits)
+	for i := range numDataBits {
+		isDataIndex[encodingIndex[i]] = struct{}{}
+	}
+	for i := range 1 << polarN {
+		if _, isData := isDataIndex[i]; !isData {
+			frozenSet[i] = struct{}{}
+		}
+	}
+
+	// Create an instance of YOUR decoder.
+	decoder := NewDecoder(polarN, frozenSet)
+	allDataBits := make([]int, 0, K*frameSize*8)
+
+	for _, codeword := range originalCodewords {
+		initialLLRs := make([]float64, len(codeword)*8)
+		for i, byteVal := range codeword {
+			for j := range 8 {
+				bit := (byteVal >> j) & 1
+				softValue := 1.0 - 2.0*float64(bit)
+				initialLLRs[i*8+j] = 2.0 * softValue
+			}
+		}
+		// Run YOUR decoder.
+		decodedInfoVector := decoder.Decode(initialLLRs)
+		for i := range numDataBits {
+			dataIndex := encodingIndex[i]
+			allDataBits = append(allDataBits, decodedInfoVector[dataIndex])
+		}
+	}
+	numFrames := len(allDataBits) / (frameSize * 8)
+	recoveredFrames := make([][]byte, numFrames)
+	bitCounter := 0
+	for i := range numFrames {
+		frameBytes := make([]byte, frameSize)
+		for j := range frameSize {
+			var packedByte byte
+			for k := range 8 {
+				if allDataBits[bitCounter] == 1 {
+					packedByte |= (1 << k)
+				}
+				bitCounter++
+			}
+			frameBytes[j] = packedByte
+		}
+		recoveredFrames[i] = frameBytes
+	}
+	return recoveredFrames, nil
 }

@@ -11,85 +11,111 @@ import (
 )
 
 func TestPolar(t *testing.T) {
-	// n := 4
-	// gnMatrix := fec.PolarGeneratorMatrix(n)
-	// formatted := mat.Formatted(gnMatrix, mat.Prefix(""), mat.Squeeze())
-	// t.Logf("Generator matrix for n=%d:\n%s", n, formatted)
-	// // fmt.Printf("Polar Generator Matrix G_N for N=%d (n=%d):\n%.0f\n", 1<<n, n, formatted)
-	// N := 1 << n
-	// dataSize := 1 // 1 byte = 8 bits
-	// inputData := make([]byte, dataSize)
+	// K := 32 // Number of data frames
+	// const frameSize = 512
 
-	// // Use crypto/rand for high-quality random data.
-	// _, err := rand.Read(inputData)
-	// if err != nil {
-	// 	t.Fatalf("Failed to generate random input data: %v", err)
-	// }
-	// fmt.Printf("Encoding %d bytes of random data with n=%d.\n", dataSize, n)
-	// fmt.Printf("This will be padded with %d zero-bytes to fill the 16-bit block.\n", N/8-dataSize)
-	// // Print a sample of the random input data
-	// fmt.Printf("Random input data (first 16 bytes is): %x\n", inputData)
-
-	// // 3. Encode the data. The EncodePolarGN function will handle the padding automatically.
-	// encodedData, err := fec.EncodePolarGN(inputData, n)
-	// if err != nil {
-	// 	t.Fatalf("Failed to encode data: %v", err)
+	// // 1. Generate K random data frames.
+	// fmt.Printf("Generating K=%d random data frames...\n\n", K)
+	// dataFrames := make([][]byte, K)
+	// for i := 0; i < K; i++ {
+	// 	dataFrames[i] = make([]byte, frameSize)
+	// 	_, err := rand.Read(dataFrames[i])
+	// 	if err != nil {
+	// 		t.Fatalf("Failed to generate random frame %d: %v", i, err)
+	// 	}
 	// }
 
-	// // 4. Print the results. The output is a full 128-byte codeword.
-	// fmt.Printf("Successfully encoded the data.\n")
-	// fmt.Printf("Encoded codeword length: %d bytes (%d bits)\n", len(encodedData), len(encodedData)*8)
-	// // Print a sample of the encoded output data
-	// fmt.Printf("Encoded data (first 16 bytes) is: %x\n", encodedData)
+	// // 2. Run the full encoding pipeline.
+	// encodingIndex, err := fec.LoadEncodingIndex("../../fec/encoding_index.bin")
+	// if err != nil {
+	// 	t.Fatalf("Failed to load encoding index: %v", err)
+	// }
+	// finalPackets, randomMap, originalCodewordsForVerification, err := fec.EncodeAndBitInterleaveFrames(dataFrames, encodingIndex)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
 
+	// fmt.Println("\n--- Encoding Complete ---")
+	// fmt.Printf("Output: %d packets, %d bytes/packet\n", len(finalPackets), len(finalPackets[0]))
+	// fmt.Printf("Random INTRA-CODEWORD map size: %d elements\n", len(randomMap))
+
+	// // --- 3. Run the Recovery Pipeline ---
+	// fmt.Println("\n--- Starting Recovery ---")
+	// recoveredCodewords, err := fec.DeinterleaveAndReassemble(finalPackets, randomMap)
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
+
+	// fmt.Println("\n--- Recovery Complete ---")
+	// fmt.Printf("Reassembled %d codewords of %d bytes each.\n", len(recoveredCodewords), len(recoveredCodewords[0]))
+
+	// // --- 4. Verification ---
+	// fmt.Println("\n--- Verification ---")
+	// if len(originalCodewordsForVerification) != len(recoveredCodewords) {
+	// 	t.Fatalf("Verification failed: Mismatched number of codewords.")
+	// }
+
+	// // Compare the first and last codeword as a sanity check
+	// if !bytes.Equal(originalCodewordsForVerification[0], recoveredCodewords[0]) {
+	// 	t.Fatalf("Verification FAILED: First original and recovered codewords do not match!")
+	// }
+	// lastIdx := len(recoveredCodewords) - 1
+	// if !bytes.Equal(originalCodewordsForVerification[lastIdx], recoveredCodewords[lastIdx]) {
+	// 	t.Fatalf("Verification FAILED: Last original and recovered codewords do not match!")
+	// }
+
+	// fmt.Println("Verification PASSED: Original and recovered codewords match successfully!")
+
+	// Load the reliability sequence from file.
+	encodingIndex, err := fec.LoadEncodingIndex("../../fec/encoding_index.bin")
+	if err != nil {
+		t.Fatalf("Critical error: Could not load encoding_index.bin. Please ensure the file exists. %v", err)
+	}
+
+	// --- Setup ---
 	K := 32 // Number of data frames
 	const frameSize = 512
+	fmt.Printf("\n--- Starting End-to-End Test (No Bit-Reversal) ---\n")
+	fmt.Printf("Parameters: K=%d frames, Frame Size=%d bytes\n\n", K, frameSize)
 
-	// 1. Generate K random data frames.
-	fmt.Printf("Generating K=%d random data frames...\n\n", K)
-	dataFrames := make([][]byte, K)
+	// 1. Generate K random data frames (the "ground truth").
+	fmt.Printf("Generating K=%d random data frames...\n", K)
+	originalDataFrames := make([][]byte, K)
 	for i := 0; i < K; i++ {
-		dataFrames[i] = make([]byte, frameSize)
-		_, err := rand.Read(dataFrames[i])
+		originalDataFrames[i] = make([]byte, frameSize)
+		_, err := rand.Read(originalDataFrames[i])
 		if err != nil {
 			t.Fatalf("Failed to generate random frame %d: %v", i, err)
 		}
 	}
 
-	// 2. Run the full encoding pipeline.
-	finalPackets, randomMap, originalCodewordsForVerification, err := fec.EncodeAndBitInterleaveFrames(dataFrames)
+	// 2. Run the full encoding and interleaving pipeline.
+	fmt.Println("\n--- Starting Encoding Pipeline ---")
+	finalPackets, randomMap, _, err := fec.EncodeAndBitInterleaveFrames(originalDataFrames, encodingIndex)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Encoding pipeline failed: %v", err)
 	}
+	fmt.Println("--- Encoding Complete ---")
 
-	fmt.Println("\n--- Encoding Complete ---")
-	fmt.Printf("Output: %d packets, %d bytes/packet\n", len(finalPackets), len(finalPackets[0]))
-	fmt.Printf("Random INTRA-CODEWORD map size: %d elements\n", len(randomMap))
-
-	// --- 3. Run the Recovery Pipeline ---
-	fmt.Println("\n--- Starting Recovery ---")
-	recoveredCodewords, err := fec.DeinterleaveAndReassemble(finalPackets, randomMap)
+	// 3. Run the full recovery and decoding pipeline.
+	recoveredDataFrames, err := fec.DecodeAndRecoverFrames(finalPackets, randomMap, encodingIndex)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Decoding pipeline failed: %v", err)
 	}
+	fmt.Println("--- Recovery Complete ---")
 
-	fmt.Println("\n--- Recovery Complete ---")
-	fmt.Printf("Reassembled %d codewords of %d bytes each.\n", len(recoveredCodewords), len(recoveredCodewords[0]))
-
-	// --- 4. Verification ---
+	// 4. Verification.
 	fmt.Println("\n--- Verification ---")
-	if len(originalCodewordsForVerification) != len(recoveredCodewords) {
-		t.Fatalf("Verification failed: Mismatched number of codewords.")
+	if len(originalDataFrames) != len(recoveredDataFrames) {
+		t.Fatalf("Verification FAILED: Mismatched number of frames. Original=%d, Recovered=%d", len(originalDataFrames), len(recoveredDataFrames))
+	}
+	for i := 0; i < K; i++ {
+		if !bytes.Equal(originalDataFrames[i], recoveredDataFrames[i]) {
+			t.Fatalf("Verification FAILED: Mismatch found in data frame %d!", i)
+		}
 	}
 
-	// Compare the first and last codeword as a sanity check
-	if !bytes.Equal(originalCodewordsForVerification[0], recoveredCodewords[0]) {
-		t.Fatalf("Verification FAILED: First original and recovered codewords do not match!")
-	}
-	lastIdx := len(recoveredCodewords) - 1
-	if !bytes.Equal(originalCodewordsForVerification[lastIdx], recoveredCodewords[lastIdx]) {
-		t.Fatalf("Verification FAILED: Last original and recovered codewords do not match!")
-	}
-
-	fmt.Println("Verification PASSED: Original and recovered codewords match successfully!")
+	fmt.Println("\n=========================================================")
+	fmt.Println("  Verification PASSED: All recovered frames match the originals!")
+	fmt.Println("=========================================================")
 }
