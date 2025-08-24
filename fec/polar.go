@@ -15,21 +15,23 @@ var (
 	cachedGcols    [][]bool
 	cachedInfoCols []int
 	cachedPolarN   int
-	// Inverse cache for single-packet erasure: index 0..31
-	invCache [32]*struct {
+	// Inverse cache for multi-packet erasure keyed by loss mask and info size
+	invCacheMap = make(map[struct {
+		mask  uint32
+		kinfo int
+	}]struct {
 		inv      [][]uint64
 		usedRows []int
-	}
+	})
 	// Cached random map to keep interleaver stable across batches (enables cache hits)
 	cachedRandMap  []int
 	cachedRandMapK int
 )
 
-func getInfoColsAndG(n int, encodingIndex []int) ([][]bool, []int) {
-	if cachedGcols != nil && cachedPolarN == n && len(cachedInfoCols) == 512 {
+func getInfoColsAndG(n int, encodingIndex []int, numDataBits int) ([][]bool, []int) {
+	if cachedGcols != nil && cachedPolarN == n && len(cachedInfoCols) == numDataBits {
 		return cachedGcols, cachedInfoCols
 	}
-	numDataBits := 512
 	infoCols := make([]int, numDataBits)
 	for i := 0; i < numDataBits; i++ {
 		infoCols[i] = bitReverseN(encodingIndex[i], n)
@@ -68,6 +70,43 @@ func getStableRandomMap(codewordBits, K int) []int {
 	cachedRandMap = m
 	cachedRandMapK = K
 	return m
+}
+
+// LoadRandomMap reads a binary file of little-endian int64 entries for the random map.
+func LoadRandomMap(filePath string, N int) ([]int, error) {
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if len(b)%8 != 0 {
+		return nil, errors.New("random map file size invalid")
+	}
+	cnt := len(b) / 8
+	if cnt != N {
+		return nil, errors.New("random map length mismatch")
+	}
+	vals64 := make([]int64, cnt)
+	if err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &vals64); err != nil {
+		return nil, err
+	}
+	vals := make([]int, cnt)
+	for i, v := range vals64 {
+		vals[i] = int(v)
+	}
+	return vals, nil
+}
+
+// SaveRandomMap writes the random map to a file as little-endian int64 values.
+func SaveRandomMap(filePath string, m []int) error {
+	vals64 := make([]int64, len(m))
+	for i, v := range m {
+		vals64[i] = int64(v)
+	}
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, vals64); err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, buf.Bytes(), 0o644)
 }
 
 // --- Polar (structured GF(2) linear code) --- //
@@ -566,6 +605,397 @@ func EncodeAndBitInterleaveFrames(dataFrames [][]byte, encodingIndex []int) (fin
 	return finalPackets, randomMap, allCodewords, nil
 }
 
+// EncodeMsgsAndBitInterleave encodes arbitrary-size messages (len in bytes, multiple of 1 byte) into 1024-bit codewords
+// and interleaves bits across K packets according to randomMap. If randomMap is nil, a stable one is generated.
+func EncodeMsgsAndBitInterleave(msgs [][]byte, encodingIndex []int, randomMap []int, K int) ([][]byte, []int, error) {
+	if K == 0 || (K&(K-1)) != 0 {
+		return nil, nil, errors.New("K must be power of 2")
+	}
+	const polarN = 10
+	const codewordBits = 1 << polarN
+	const codewordBytes = codewordBits / 8
+	numCodewords := len(msgs)
+	codewords := make([][]byte, numCodewords)
+	for i, m := range msgs {
+		if (len(m) * 8) > len(encodingIndex) {
+			return nil, nil, errors.New("encodingIndex too short for msg")
+		}
+		cw, err := EncodePolarGN(m, polarN, encodingIndex)
+		if err != nil {
+			return nil, nil, err
+		}
+		codewords[i] = cw
+	}
+	if randomMap == nil {
+		randomMap = getStableRandomMap(codewordBits, K)
+	}
+	subsetSizeBits := codewordBits / K
+	outputPacketSizeBits := numCodewords * subsetSizeBits
+	outBits := make([][]bool, K)
+	for i := range outBits {
+		outBits[i] = make([]bool, outputPacketSizeBits)
+	}
+	cwBits := make([]bool, codewordBits)
+	shuffled := make([]bool, codewordBits)
+	for cwIdx, cw := range codewords {
+		for i, b := range cw {
+			for bit := 0; bit < 8; bit++ {
+				cwBits[i*8+bit] = ((b >> bit) & 1) == 1
+			}
+		}
+		for i := 0; i < codewordBits; i++ {
+			shuffled[i] = cwBits[randomMap[i]]
+		}
+		for subset := 0; subset < K; subset++ {
+			start := subset * subsetSizeBits
+			dest := outBits[subset]
+			off := cwIdx * subsetSizeBits
+			copy(dest[off:off+subsetSizeBits], shuffled[start:start+subsetSizeBits])
+		}
+	}
+	packets := make([][]byte, K)
+	outBytes := outputPacketSizeBits / 8
+	for i := 0; i < K; i++ {
+		p := make([]byte, outBytes)
+		for j := 0; j < outBytes; j++ {
+			var x byte
+			for b := 0; b < 8; b++ {
+				if outBits[i][j*8+b] {
+					x |= 1 << b
+				}
+			}
+			p[j] = x
+		}
+		packets[i] = p
+	}
+	return packets, randomMap, nil
+}
+
+// DeinterleaveKnownGeneric reconstructs codeword bits from packets for arbitrary batch size.
+func DeinterleaveKnownGeneric(interleavedPackets [][]byte, randomMap []int) ([][]bool, error) {
+	K := len(interleavedPackets)
+	if K == 0 {
+		return nil, errors.New("no packets")
+	}
+	const codewordBits = 1024
+	subsetSizeBits := codewordBits / K
+	// infer numCodewords from packet size
+	var pktLen int
+	for _, p := range interleavedPackets {
+		if len(p) > 0 {
+			pktLen = len(p)
+			break
+		}
+	}
+	if pktLen == 0 {
+		return nil, errors.New("all packets missing")
+	}
+	totalBits := pktLen * 8
+	if totalBits%subsetSizeBits != 0 {
+		return nil, errors.New("packet size invalid for K")
+	}
+	numCodewords := totalBits / subsetSizeBits
+	// unpack
+	pktBits := make([][]bool, K)
+	present := make([]bool, K)
+	for i, p := range interleavedPackets {
+		if len(p) == 0 {
+			present[i] = false
+			continue
+		}
+		present[i] = true
+		bits := make([]bool, len(p)*8)
+		for j, by := range p {
+			for b := 0; b < 8; b++ {
+				bits[j*8+b] = ((by >> b) & 1) == 1
+			}
+		}
+		pktBits[i] = bits
+	}
+	// gather shuffled
+	shuffled := make([][]bool, numCodewords)
+	for cw := 0; cw < numCodewords; cw++ {
+		s := make([]bool, codewordBits)
+		for subset := 0; subset < K; subset++ {
+			start := subset * subsetSizeBits
+			if present[subset] {
+				src := pktBits[subset]
+				off := cw * subsetSizeBits
+				copy(s[start:start+subsetSizeBits], src[off:off+subsetSizeBits])
+			}
+		}
+		shuffled[cw] = s
+	}
+	// de-shuffle
+	inv := invertMap(randomMap)
+	out := make([][]bool, numCodewords)
+	for cw := 0; cw < numCodewords; cw++ {
+		b := make([]bool, codewordBits)
+		for i := 0; i < codewordBits; i++ {
+			b[i] = shuffled[cw][inv[i]]
+		}
+		out[cw] = b
+	}
+	return out, nil
+}
+
+// DecodeMsgs decodes variable-size messages (numDataBits) from interleaved packets using algebraic erasure decoding.
+func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, numDataBits int) ([][]byte, error) {
+	K := len(interleavedPackets)
+	const polarN = 10
+	// Recover known codeword bits (unknown bits remain false)
+	cwBits, err := DeinterleaveKnownGeneric(interleavedPackets, randomMap)
+	if err != nil {
+		return nil, errors.New("failed to reassemble")
+	}
+	// Fast path: no loss
+	dropCount := 0
+	for _, p := range interleavedPackets {
+		if len(p) == 0 {
+			dropCount++
+		}
+	}
+	if dropCount == 0 {
+		allDataBits := make([]int, 0, len(cwBits)*numDataBits)
+		N := 1 << polarN
+		dataIdx := make([]int, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			dataIdx[i] = bitReverseN(encodingIndex[i], polarN)
+		}
+		u := make([]bool, N)
+		for cw := 0; cw < len(cwBits); cw++ {
+			copy(u, cwBits[cw])
+			for s := 0; s < polarN; s++ {
+				block := 1 << (s + 1)
+				half := 1 << s
+				for start := 0; start < N; start += block {
+					for k := 0; k < half; k++ {
+						i1 := start + k
+						i2 := i1 + half
+						u[i1] = u[i1] != u[i2]
+					}
+				}
+			}
+			for i := 0; i < numDataBits; i++ {
+				if u[dataIdx[i]] {
+					allDataBits = append(allDataBits, 1)
+				} else {
+					allDataBits = append(allDataBits, 0)
+				}
+			}
+		}
+		numMsgs := len(allDataBits) / numDataBits
+		out := make([][]byte, numMsgs)
+		bit := 0
+		for i := 0; i < numMsgs; i++ {
+			b := make([]byte, numDataBits/8)
+			for j := 0; j < len(b); j++ {
+				var x byte
+				for k := 0; k < 8; k++ {
+					if allDataBits[bit] == 1 {
+						x |= 1 << k
+					}
+					bit++
+				}
+				b[j] = x
+			}
+			out[i] = b
+		}
+		return out, nil
+	}
+	// Build info columns
+	Gcols, _ := getInfoColsAndG(polarN, encodingIndex, numDataBits)
+	N := 1 << polarN
+	// Build loss mask and known rows from randomMap
+	var mask uint32
+	for i, p := range interleavedPackets {
+		if len(p) == 0 {
+			mask |= 1 << uint(i)
+		}
+	}
+	subsetSizeBits := N / K
+	presentRow := make([]bool, N)
+	for i := 0; i < N; i++ {
+		presentRow[i] = true
+	}
+	for subset := 0; subset < K; subset++ {
+		if (mask>>uint(subset))&1 == 1 {
+			start := subset * subsetSizeBits
+			for pos := start; pos < start+subsetSizeBits; pos++ {
+				presentRow[randomMap[pos]] = false
+			}
+		}
+	}
+	knownRowIdx := make([]int, 0, N)
+	for r := 0; r < N; r++ {
+		if presentRow[r] {
+			knownRowIdx = append(knownRowIdx, r)
+		}
+	}
+	// Check cache
+	if e, ok := invCacheMap[struct {
+		mask  uint32
+		kinfo int
+	}{mask: mask, kinfo: numDataBits}]; ok {
+		invAsqPacked := e.inv
+		usedRows := e.usedRows
+		// Batch solve
+		numCW := len(cwBits)
+		wordsCW := (numCW + 63) / 64
+		B := make([][]uint64, numDataBits)
+		for c := 0; c < numDataBits; c++ {
+			row := make([]uint64, wordsCW)
+			for cw := 0; cw < numCW; cw++ {
+				if cwBits[cw][usedRows[c]] {
+					row[cw>>6] |= 1 << (uint(cw) & 63)
+				}
+			}
+			B[c] = row
+		}
+		Out := make([][]uint64, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			acc := make([]uint64, wordsCW)
+			for pb := 0; pb < len(invAsqPacked[i]); pb++ {
+				m := invAsqPacked[i][pb]
+				for m != 0 {
+					tz := bits.TrailingZeros64(m)
+					col := (pb << 6) + tz
+					brow := B[col]
+					for w := 0; w < wordsCW; w++ {
+						acc[w] ^= brow[w]
+					}
+					m &= m - 1
+				}
+			}
+			Out[i] = acc
+		}
+		// Pack
+		allDataBits := make([]int, 0, len(cwBits)*numDataBits)
+		for cw := 0; cw < numCW; cw++ {
+			w := cw >> 6
+			b := uint(cw) & 63
+			for i := 0; i < numDataBits; i++ {
+				if ((Out[i][w] >> b) & 1) == 1 {
+					allDataBits = append(allDataBits, 1)
+				} else {
+					allDataBits = append(allDataBits, 0)
+				}
+			}
+		}
+		numMsgs := len(allDataBits) / numDataBits
+		out := make([][]byte, numMsgs)
+		bit := 0
+		for i := 0; i < numMsgs; i++ {
+			bts := make([]byte, numDataBits/8)
+			for j := 0; j < len(bts); j++ {
+				var x byte
+				for k := 0; k < 8; k++ {
+					if allDataBits[bit] == 1 {
+						x |= 1 << k
+					}
+					bit++
+				}
+				bts[j] = x
+			}
+			out[i] = bts
+		}
+		return out, nil
+	}
+	// Assemble A
+	rowsA := make([][]bool, 0, len(knownRowIdx))
+	for _, r := range knownRowIdx {
+		arow := make([]bool, numDataBits)
+		for c := 0; c < numDataBits; c++ {
+			arow[c] = Gcols[c][r]
+		}
+		rowsA = append(rowsA, arow)
+	}
+	// Choose K independent rows
+	pivotRows, ok := selectPivotRows(rowsA, numDataBits)
+	if !ok {
+		return nil, errors.New("polar erasure rank deficiency")
+	}
+	Asq := make([][]bool, numDataBits)
+	for i := 0; i < numDataBits; i++ {
+		Asq[i] = append([]bool(nil), rowsA[pivotRows[i]]...)
+	}
+	invAsqPacked, ok := invertBoolMatrixGF2Packed(Asq)
+	if !ok {
+		return nil, errors.New("polar erasure inversion failed")
+	}
+	usedRows := make([]int, numDataBits)
+	for i := 0; i < numDataBits; i++ {
+		usedRows[i] = knownRowIdx[pivotRows[i]]
+	}
+	invCacheMap[struct {
+		mask  uint32
+		kinfo int
+	}{mask: mask, kinfo: numDataBits}] = struct {
+		inv      [][]uint64
+		usedRows []int
+	}{inv: invAsqPacked, usedRows: usedRows}
+	// Batch solve
+	numCW := len(cwBits)
+	wordsCW := (numCW + 63) / 64
+	B := make([][]uint64, numDataBits)
+	for c := 0; c < numDataBits; c++ {
+		row := make([]uint64, wordsCW)
+		for cw := 0; cw < numCW; cw++ {
+			if cwBits[cw][usedRows[c]] {
+				row[cw>>6] |= 1 << (uint(cw) & 63)
+			}
+		}
+		B[c] = row
+	}
+	Out := make([][]uint64, numDataBits)
+	for i := 0; i < numDataBits; i++ {
+		acc := make([]uint64, wordsCW)
+		for pb := 0; pb < len(invAsqPacked[i]); pb++ {
+			m := invAsqPacked[i][pb]
+			for m != 0 {
+				tz := bits.TrailingZeros64(m)
+				col := (pb << 6) + tz
+				brow := B[col]
+				for w := 0; w < wordsCW; w++ {
+					acc[w] ^= brow[w]
+				}
+				m &= m - 1
+			}
+		}
+		Out[i] = acc
+	}
+	allDataBits := make([]int, 0, len(cwBits)*numDataBits)
+	for cw := 0; cw < numCW; cw++ {
+		w := cw >> 6
+		b := uint(cw) & 63
+		for i := 0; i < numDataBits; i++ {
+			if ((Out[i][w] >> b) & 1) == 1 {
+				allDataBits = append(allDataBits, 1)
+			} else {
+				allDataBits = append(allDataBits, 0)
+			}
+		}
+	}
+	numMsgs := len(allDataBits) / numDataBits
+	out := make([][]byte, numMsgs)
+	bit := 0
+	for i := 0; i < numMsgs; i++ {
+		bts := make([]byte, numDataBits/8)
+		for j := 0; j < len(bts); j++ {
+			var x byte
+			for k := 0; k < 8; k++ {
+				if allDataBits[bit] == 1 {
+					x |= 1 << k
+				}
+				bit++
+			}
+			bts[j] = x
+		}
+		out[i] = bts
+	}
+	return out, nil
+}
+
 // If map[new_idx] = old_idx, then invMap[old_idx] = new_idx.
 func invertMap(forwardMap []int) []int {
 	n := len(forwardMap)
@@ -973,7 +1403,7 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 	}
 
 	// Erasure path: Build only the K=512 info columns using butterfly
-	Gcols, infoCols := getInfoColsAndG(polarN, encodingIndex)
+	Gcols, infoCols := getInfoColsAndG(polarN, encodingIndex, numDataBits)
 	N := 1 << polarN
 
 	// Build known rows from randomMap using dropIdx
@@ -995,11 +1425,18 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 		}
 	}
 
-	// Use inverse cache indexed by dropped packet index if available
-	if dropIdx >= 0 && dropIdx < 32 {
-		if invCache[dropIdx] != nil {
-			invAsqPacked := invCache[dropIdx].inv
-			usedRows := invCache[dropIdx].usedRows
+	// Use inverse cache indexed by loss mask and info size if available
+	var mask uint32
+	if dropIdx >= 0 {
+		mask = 1 << uint(dropIdx)
+	}
+	if dropIdx >= 0 {
+		if e, ok := invCacheMap[struct {
+			mask  uint32
+			kinfo int
+		}{mask: mask, kinfo: numDataBits}]; ok {
+			invAsqPacked := e.inv
+			usedRows := e.usedRows
 			// Batch solve using cached inverse
 			numCW := len(cwBits)
 			wordsCW := (numCW + 63) / 64
@@ -1119,8 +1556,8 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 	if !ok {
 		return nil, errors.New("polar erasure inversion failed")
 	}
-	// Cache inverse for this dropIdx if within 0..31
-	if dropIdx >= 0 && dropIdx < 32 {
+	// Cache inverse for this mask
+	if dropIdx >= 0 {
 		usedRows := make([]int, numDataBits)
 		if haveAll {
 			for i := 0; i < numDataBits; i++ {
@@ -1132,7 +1569,10 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 				usedRows[i] = knownRowIdx[pr[i]]
 			}
 		}
-		invCache[dropIdx] = &struct {
+		invCacheMap[struct {
+			mask  uint32
+			kinfo int
+		}{mask: mask, kinfo: numDataBits}] = struct {
 			inv      [][]uint64
 			usedRows []int
 		}{inv: invAsqPacked, usedRows: usedRows}
