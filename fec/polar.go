@@ -975,66 +975,7 @@ func DeinterleaveKnownGeneric(interleavedPackets [][]byte, randomMap []int) ([][
 func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, numDataBits int) ([][]byte, error) {
 	K := len(interleavedPackets)
 	const polarN = 10
-	// Detect loss quickly
-	dropCount := 0
-	for _, p := range interleavedPackets {
-		if len(p) == 0 {
-			dropCount++
-		}
-	}
-	if dropCount == 0 {
-		// No-loss: reconstruct codewords and apply self-inverse butterfly
-		cwBits, err := DeinterleaveKnownGeneric(interleavedPackets, randomMap)
-		if err != nil {
-			return nil, errors.New("failed to reassemble")
-		}
-		allDataBits := make([]int, 0, len(cwBits)*numDataBits)
-		N := 1 << polarN
-		dataIdx := make([]int, numDataBits)
-		for i := 0; i < numDataBits; i++ {
-			dataIdx[i] = bitReverseN(encodingIndex[i], polarN)
-		}
-		u := make([]bool, N)
-		for cw := 0; cw < len(cwBits); cw++ {
-			copy(u, cwBits[cw])
-			for s := 0; s < polarN; s++ {
-				block := 1 << (s + 1)
-				half := 1 << s
-				for start := 0; start < N; start += block {
-					for k := 0; k < half; k++ {
-						i1 := start + k
-						i2 := i1 + half
-						u[i1] = u[i1] != u[i2]
-					}
-				}
-			}
-			for i := 0; i < numDataBits; i++ {
-				if u[dataIdx[i]] {
-					allDataBits = append(allDataBits, 1)
-				} else {
-					allDataBits = append(allDataBits, 0)
-				}
-			}
-		}
-		numMsgs := len(allDataBits) / numDataBits
-		out := make([][]byte, numMsgs)
-		bit := 0
-		for i := 0; i < numMsgs; i++ {
-			b := make([]byte, numDataBits/8)
-			for j := 0; j < len(b); j++ {
-				var x byte
-				for k := 0; k < 8; k++ {
-					if allDataBits[bit] == 1 {
-						x |= 1 << k
-					}
-					bit++
-				}
-				b[j] = x
-			}
-			out[i] = b
-		}
-		return out, nil
-	}
+	// We route both loss and no-loss cases through the packed algebraic path for speed and consistency.
 	// Build info columns
 	Gcols, _ := getInfoColsAndG(polarN, encodingIndex, numDataBits)
 	N := 1 << polarN

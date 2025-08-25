@@ -14,7 +14,7 @@ import (
 
 func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 	root := repoRoot(t)
-	srcPath := filepath.Join(root, "test_data", "test_FD001.txt")
+	srcPath := filepath.Join(root, "test_data", "train_FD001.txt")
 	dstPath := filepath.Join(root, "test_data", "decode_FD001.txt")
 	idxPath := filepath.Join(root, "fec", "encoding_index.bin")
 	mapPath := filepath.Join(root, "fec", "random_map_1024.bin")
@@ -33,10 +33,10 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 	}
 
 	const Kbatch = 32                       // packets per batch
-	const numDataBits = 8                   // 16 bytes per codeword
+	const numDataBits = 512                 // 16 bytes per codeword
 	const msgSize = numDataBits / 8         // 16 bytes
 	const numMsgsPerBatch = 1024 / 128 * 32 // keeps packet size = 1024 bytes (256 * 32 bits)
-	const drop_num = 9
+	const drop_num = 3
 
 	encTotal := time.Duration(0)
 	decTotal := time.Duration(0)
