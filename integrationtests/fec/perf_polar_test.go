@@ -14,10 +14,11 @@ import (
 
 func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 	root := repoRoot(t)
-	srcPath := filepath.Join(root, "test_data", "train_FD001.txt")
+	srcPath := filepath.Join(root, "test_data", "test_FD001.txt")
 	dstPath := filepath.Join(root, "test_data", "decode_FD001.txt")
 	idxPath := filepath.Join(root, "fec", "encoding_index.bin")
 	mapPath := filepath.Join(root, "fec", "random_map_1024.bin")
+	// Packet LUT persisted file (tied to n=10, kinfo, K; internal CRC binds to map contents)
 
 	// Load file
 	src, err := os.ReadFile(srcPath)
@@ -31,10 +32,11 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 		t.Fatalf("load encoding index: %v", err)
 	}
 
-	const Kbatch = 32               // packets per batch
-	const numDataBits = 128         // 16 bytes per codeword
-	const msgSize = numDataBits / 8 // 16
-	const numMsgsPerBatch = 256     // keeps packet size = 1024 bytes (256 * 32 bits)
+	const Kbatch = 32                       // packets per batch
+	const numDataBits = 8                   // 16 bytes per codeword
+	const msgSize = numDataBits / 8         // 16 bytes
+	const numMsgsPerBatch = 1024 / 128 * 32 // keeps packet size = 1024 bytes (256 * 32 bits)
+	const drop_num = 9
 
 	encTotal := time.Duration(0)
 	decTotal := time.Duration(0)
@@ -82,7 +84,7 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 		// Simulate loss: drop exactly 10 distinct packets out of 32 for this batch
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		perm := r.Perm(Kbatch)
-		for i := 0; i < 12; i++ {
+		for i := 0; i < drop_num; i++ {
 			packets[perm[i]] = nil
 		}
 
@@ -111,7 +113,7 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 
 	total := encTotal + decTotal
 	t.Logf("Polar encode time (total): %v", encTotal)
-	t.Logf("Polar decode time (total) [10 drops of 32, 128 bits]: %v", decTotal)
+	t.Logf("Polar decode time (total) [%d drops of 32, 128 bits]: %v", drop_num, decTotal)
 	t.Logf("Total time: %v", total)
 	fmt.Printf("Polar encode(total)=%v, decode(total)=%v, total=%v\n", encTotal, decTotal, total)
 }
