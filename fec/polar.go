@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"math"
 	"math/bits"
 	"math/rand"
 	"os"
@@ -17,20 +16,6 @@ var (
 	cachedInfoCols   []int
 	cachedPolarN     int
 	cachedPackedCols [][]uint64
-	// Inverse cache for multi-packet erasure keyed by loss mask and info size
-	invCacheMap = make(map[struct {
-		mask  uint32
-		kinfo int
-	}]struct {
-		inv         [][]uint64
-		usedRows    []int
-		subsetBytes int
-		// Per-selected-row metadata to speed RHS building on warm path
-		rowInfo []struct {
-			subset, byteOff int
-			bitMask         byte
-		}
-	})
 	// Cached random map to keep interleaver stable across batches (enables cache hits)
 	cachedRandMap  []int
 	cachedRandMapK int
@@ -49,6 +34,23 @@ var (
 	cachedPacketLUTBits   int
 	cachedPacketLUTK      int
 	cachedPacketLUTMapRef []int
+	// Inverse cache for multi-packet erasure keyed by loss mask and info size
+	invCacheMap = make(map[struct {
+		mask  uint32
+		kinfo int
+	}]struct {
+		inv         [][]uint64
+		usedRows    []int
+		subsetBytes int
+		// Per-selected-row metadata to speed RHS building on warm path
+		rowInfo []struct {
+			subset, byteOff int
+			bitMask         byte
+		}
+	})
+	// Cached inverse of randomMap for fast lookups
+	cachedInvMap    []int
+	cachedInvMapRef []int
 )
 
 // --- Decode metrics (warm vs cold) ---
@@ -59,6 +61,77 @@ var polarDecodeMetrics struct {
 	coldTotal time.Duration
 	warmCWs   int
 	coldCWs   int
+}
+
+// Fine-grained phase metrics to avoid ambiguity
+var polarPhaseMetrics struct {
+	invBuilds   int
+	invBuildTot time.Duration
+	bBuildTot   time.Duration
+	mulTot      time.Duration
+	packTot     time.Duration
+	batches     int
+	totalCW     int
+	coldCW      int // total CWs in batches where an inverse was built
+}
+
+// PolarPerfBreakdown exposes detailed decode timings.
+type PolarPerfBreakdown struct {
+	InvBuilds          int
+	InvBuildTotal      time.Duration
+	AvgInvPerBuild     time.Duration
+	BBuildTotal        time.Duration
+	MulTotal           time.Duration
+	PackTotal          time.Duration
+	Batches            int
+	TotalCodewords     int
+	TotalColdBatchCWs  int
+	WarmAvgPerCW       time.Duration
+	ColdAmortizedPerCW time.Duration
+}
+
+// GetPolarPerfBreakdown returns a snapshot of phase metrics.
+func GetPolarPerfBreakdown() PolarPerfBreakdown {
+	avgInv := time.Duration(0)
+	if polarPhaseMetrics.invBuilds > 0 {
+		avgInv = time.Duration(int64(polarPhaseMetrics.invBuildTot) / int64(polarPhaseMetrics.invBuilds))
+	}
+	warmDen := polarPhaseMetrics.totalCW
+	warmAvg := time.Duration(0)
+	if warmDen > 0 {
+		warmAvg = time.Duration(int64(polarPhaseMetrics.bBuildTot+polarPhaseMetrics.mulTot+polarPhaseMetrics.packTot) / int64(warmDen))
+	}
+	coldAmort := time.Duration(0)
+	if polarPhaseMetrics.coldCW > 0 {
+		coldAmort = time.Duration(int64(polarPhaseMetrics.invBuildTot) / int64(polarPhaseMetrics.coldCW))
+	}
+	return PolarPerfBreakdown{
+		InvBuilds:          polarPhaseMetrics.invBuilds,
+		InvBuildTotal:      polarPhaseMetrics.invBuildTot,
+		AvgInvPerBuild:     avgInv,
+		BBuildTotal:        polarPhaseMetrics.bBuildTot,
+		MulTotal:           polarPhaseMetrics.mulTot,
+		PackTotal:          polarPhaseMetrics.packTot,
+		Batches:            polarPhaseMetrics.batches,
+		TotalCodewords:     polarPhaseMetrics.totalCW,
+		TotalColdBatchCWs:  polarPhaseMetrics.coldCW,
+		WarmAvgPerCW:       warmAvg,
+		ColdAmortizedPerCW: coldAmort,
+	}
+}
+
+// ResetPolarPerfStats clears the detailed decode metrics.
+func ResetPolarPerfStats() {
+	polarPhaseMetrics = struct {
+		invBuilds   int
+		invBuildTot time.Duration
+		bBuildTot   time.Duration
+		mulTot      time.Duration
+		packTot     time.Duration
+		batches     int
+		totalCW     int
+		coldCW      int
+	}{}
 }
 
 // PolarDecodeStats is an exported snapshot of decode metrics.
@@ -91,6 +164,7 @@ func GetPolarDecodeStats() PolarDecodeStats {
 		AvgWarmPerCW:  avgWarm,
 		AvgColdPerCW:  avgCold,
 	}
+
 }
 
 // ResetPolarDecodeStats clears accumulated decode metrics.
@@ -152,10 +226,8 @@ func getPackedInfoCols(n int, encodingIndex []int, numDataBits int) ([][]uint64,
 	return packed, infoCols
 }
 
-// getByteLUT builds a LUT per message byte position: for each possible byte value (0..255),
-// precompute the XOR of the 8 corresponding packed columns. Layout: lut[pos][val*words + w].
-// getByteLUT removed in favor of packet-level LUT fused encoder path
-
+// getStableRandomMap returns a deterministic random permutation of [0..codewordBits-1]
+// using a fixed seed, cached by K to align subset partitioning.
 func getStableRandomMap(codewordBits, K int) []int {
 	if cachedRandMap != nil && cachedRandMapK == K {
 		return cachedRandMap
@@ -164,7 +236,7 @@ func getStableRandomMap(codewordBits, K int) []int {
 	m := r.Perm(codewordBits)
 	cachedRandMap = m
 	cachedRandMapK = K
-	// Invalidate interleave plan cache
+	// Invalidate interleave plan cache when map or K changes
 	cachedPlanMap = nil
 	cachedPlan = nil
 	return m
@@ -1016,6 +1088,7 @@ func DeinterleaveKnownGeneric(interleavedPackets [][]byte, randomMap []int) ([][
 
 // DecodeMsgs decodes variable-size messages (numDataBits) from interleaved packets using algebraic erasure decoding.
 func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, numDataBits int) ([][]byte, error) {
+	totalStart := time.Now()
 	K := len(interleavedPackets)
 	const polarN = 10
 	// We route both loss and no-loss cases through the packed algebraic path for speed and consistency.
@@ -1031,7 +1104,28 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			present[i] = true
 		}
 	}
-	inv := invertMap(randomMap)
+	// Get cached inverse map
+	var inv []int
+	if cachedInvMap != nil && cachedInvMapRef != nil && len(cachedInvMapRef) == len(randomMap) {
+		same := true
+		for i := range randomMap {
+			if randomMap[i] != cachedInvMapRef[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			inv = cachedInvMap
+		} else {
+			inv = invertMap(randomMap)
+			cachedInvMap = inv
+			cachedInvMapRef = append([]int(nil), randomMap...)
+		}
+	} else {
+		inv = invertMap(randomMap)
+		cachedInvMap = inv
+		cachedInvMapRef = append([]int(nil), randomMap...)
+	}
 	// We don't need to materialize the full list of known rows here; we'll select rows on the fly.
 	// Helper to build B directly from packets for selected rows
 	buildB := func(usedRows []int) (B [][]uint64, numCW int) {
@@ -1105,7 +1199,6 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		mask  uint32
 		kinfo int
 	}{mask: mask, kinfo: numDataBits}]; ok {
-		tStart := time.Now()
 		invAsqPacked := e.inv
 		usedRows := e.usedRows
 		// Build B directly from packets using cached rowInfo when available
@@ -1125,6 +1218,7 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			numCW = totalBits / subsetSizeBits
 			wordsCW := (numCW + 63) / 64
 			B = make([][]uint64, numDataBits)
+			tBStart := time.Now()
 			for c := 0; c < numDataBits; c++ {
 				info := e.rowInfo[c]
 				row := make([]uint64, wordsCW)
@@ -1140,44 +1234,66 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 				}
 				B[c] = row
 			}
+			polarPhaseMetrics.bBuildTot += time.Since(tBStart)
 		} else {
+			tBStart := time.Now()
 			B, numCW = buildB(usedRows)
+			polarPhaseMetrics.bBuildTot += time.Since(tBStart)
 		}
 		wordsCW := (numCW + 63) / 64
+		tMul := time.Now()
 		Out := computeOut(invAsqPacked, B, wordsCW, numDataBits)
-		// Pack
-		allDataBits := make([]int, 0, numCW*numDataBits)
-		for cw := 0; cw < numCW; cw++ {
+		polarPhaseMetrics.mulTot += time.Since(tMul)
+		// Pack directly to output bytes
+		numMsgs := numCW
+		out := make([][]byte, numMsgs)
+		tPack := time.Now()
+		for cw := 0; cw < numMsgs; cw++ {
 			w := cw >> 6
 			b := uint(cw) & 63
-			for i := 0; i < numDataBits; i++ {
-				if ((Out[i][w] >> b) & 1) == 1 {
-					allDataBits = append(allDataBits, 1)
-				} else {
-					allDataBits = append(allDataBits, 0)
-				}
-			}
-		}
-		numMsgs := len(allDataBits) / numDataBits
-		out := make([][]byte, numMsgs)
-		bit := 0
-		for i := 0; i < numMsgs; i++ {
 			bts := make([]byte, numDataBits/8)
 			for j := 0; j < len(bts); j++ {
 				var x byte
-				for k := 0; k < 8; k++ {
-					if allDataBits[bit] == 1 {
-						x |= 1 << k
-					}
-					bit++
+				base := j * 8
+				if ((Out[base+0][w] >> b) & 1) == 1 {
+					x |= 1 << 0
+				}
+				if ((Out[base+1][w] >> b) & 1) == 1 {
+					x |= 1 << 1
+				}
+				if ((Out[base+2][w] >> b) & 1) == 1 {
+					x |= 1 << 2
+				}
+				if ((Out[base+3][w] >> b) & 1) == 1 {
+					x |= 1 << 3
+				}
+				if ((Out[base+4][w] >> b) & 1) == 1 {
+					x |= 1 << 4
+				}
+				if ((Out[base+5][w] >> b) & 1) == 1 {
+					x |= 1 << 5
+				}
+				if ((Out[base+6][w] >> b) & 1) == 1 {
+					x |= 1 << 6
+				}
+				if ((Out[base+7][w] >> b) & 1) == 1 {
+					x |= 1 << 7
 				}
 				bts[j] = x
 			}
-			out[i] = bts
+			out[cw] = bts
 		}
-		// metrics: warm path
-		polarDecodeMetrics.warmTotal += time.Since(tStart)
-		polarDecodeMetrics.warmCWs += numCW
+		polarPhaseMetrics.packTot += time.Since(tPack)
+		polarPhaseMetrics.totalCW += numCW
+		polarPhaseMetrics.batches++
+		// metrics: per-batch accounting: 1 cold CW (no inversion time on cache hit), rest warm
+		totalDur := time.Since(totalStart)
+		polarDecodeMetrics.coldCWs += 1
+		// no addition to coldTotal since we reused inverse (invDur=0)
+		if numCW > 1 {
+			polarDecodeMetrics.warmCWs += (numCW - 1)
+			polarDecodeMetrics.warmTotal += totalDur
+		}
 		return out, nil
 	}
 	// Row selection: try a fast greedy assignment using (r & j)==j; fall back to packed-basis selection.
@@ -1286,11 +1402,15 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			Asq[i] = row
 		}
 	}
-	tStart := time.Now()
+	// Measure inversion time separately to attribute to a single cold CW
+	invStart := time.Now()
 	invAsqPacked, ok := invertBoolMatrixGF2Packed(Asq)
 	if !ok {
 		return nil, errors.New("polar erasure inversion failed")
 	}
+	invDur := time.Since(invStart)
+	polarPhaseMetrics.invBuilds++
+	polarPhaseMetrics.invBuildTot += invDur
 	// Cache inverse, used rows, and per-row metadata for warm RHS builds
 	// Precompute rowInfo
 	subsetBytes := subsetSizeBits / 8
@@ -1320,9 +1440,40 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			bitMask         byte
 		}
 	}{inv: invAsqPacked, usedRows: usedRows, subsetBytes: subsetBytes, rowInfo: rowInfo}
-	// Build B and batch solve
-	B, numCW := buildB(usedRows)
+	// Build B using precomputed rowInfo (same as warm path)
+	// infer num codewords from any present packet
+	tBStart := time.Now()
+	var pktLen int
+	for i := 0; i < K; i++ {
+		if present[i] {
+			pktLen = len(interleavedPackets[i])
+			break
+		}
+	}
+	totalBits := pktLen * 8
+	numCW := totalBits / subsetSizeBits
 	wordsCW := (numCW + 63) / 64
+	B := make([][]uint64, numDataBits)
+	for c := 0; c < numDataBits; c++ {
+		info := rowInfo[c]
+		row := make([]uint64, wordsCW)
+		if present[info.subset] {
+			pkt := interleavedPackets[info.subset]
+			base := info.byteOff
+			for cw := 0; cw < numCW; cw++ {
+				idx := cw*subsetBytes + base
+				if pkt[idx]&info.bitMask != 0 {
+					row[cw>>6] |= 1 << uint(cw&63)
+				}
+			}
+		}
+		B[c] = row
+	}
+	polarPhaseMetrics.bBuildTot += time.Since(tBStart)
+	polarPhaseMetrics.totalCW += numCW
+	polarPhaseMetrics.coldCW += numCW
+	polarPhaseMetrics.batches++
+	tMul := time.Now()
 	Out := make([][]uint64, numDataBits)
 	for i := 0; i < numDataBits; i++ {
 		acc := make([]uint64, wordsCW)
@@ -1340,38 +1491,58 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		}
 		Out[i] = acc
 	}
-	allDataBits := make([]int, 0, numCW*numDataBits)
-	for cw := 0; cw < numCW; cw++ {
+	polarPhaseMetrics.mulTot += time.Since(tMul)
+	// Pack directly to output bytes
+	numMsgs := numCW
+	out := make([][]byte, numMsgs)
+	tPack := time.Now()
+	for cw := 0; cw < numMsgs; cw++ {
 		w := cw >> 6
 		b := uint(cw) & 63
-		for i := 0; i < numDataBits; i++ {
-			if ((Out[i][w] >> b) & 1) == 1 {
-				allDataBits = append(allDataBits, 1)
-			} else {
-				allDataBits = append(allDataBits, 0)
-			}
-		}
-	}
-	numMsgs := len(allDataBits) / numDataBits
-	out := make([][]byte, numMsgs)
-	bit := 0
-	for i := 0; i < numMsgs; i++ {
 		bts := make([]byte, numDataBits/8)
 		for j := 0; j < len(bts); j++ {
 			var x byte
-			for k := 0; k < 8; k++ {
-				if allDataBits[bit] == 1 {
-					x |= 1 << k
-				}
-				bit++
+			base := j * 8
+			if ((Out[base+0][w] >> b) & 1) == 1 {
+				x |= 1 << 0
+			}
+			if ((Out[base+1][w] >> b) & 1) == 1 {
+				x |= 1 << 1
+			}
+			if ((Out[base+2][w] >> b) & 1) == 1 {
+				x |= 1 << 2
+			}
+			if ((Out[base+3][w] >> b) & 1) == 1 {
+				x |= 1 << 3
+			}
+			if ((Out[base+4][w] >> b) & 1) == 1 {
+				x |= 1 << 4
+			}
+			if ((Out[base+5][w] >> b) & 1) == 1 {
+				x |= 1 << 5
+			}
+			if ((Out[base+6][w] >> b) & 1) == 1 {
+				x |= 1 << 6
+			}
+			if ((Out[base+7][w] >> b) & 1) == 1 {
+				x |= 1 << 7
 			}
 			bts[j] = x
 		}
-		out[i] = bts
+		out[cw] = bts
 	}
-	// metrics: cold path
-	polarDecodeMetrics.coldTotal += time.Since(tStart)
-	polarDecodeMetrics.coldCWs += numCW
+	polarPhaseMetrics.packTot += time.Since(tPack)
+	// metrics: attribute inversion time to 1 cold CW, rest to warm CWs
+	totalDur := time.Since(totalStart)
+	if numCW > 0 {
+		polarDecodeMetrics.coldTotal += invDur
+		polarDecodeMetrics.coldCWs += 1
+		// remaining duration counts as warm across the remaining codewords
+		polarDecodeMetrics.warmTotal += totalDur - invDur
+		if numCW > 1 {
+			polarDecodeMetrics.warmCWs += (numCW - 1)
+		}
+	}
 	return out, nil
 }
 
@@ -1549,32 +1720,43 @@ func DeinterleaveAndReassembleKnown(interleavedPackets [][]byte, randomMap []int
 	if K == 0 {
 		return nil, nil, errors.New("input packets cannot be empty")
 	}
-	const outputPacketSizeBytes = 1024
-	const codewordBytes = 128
-	const codewordBits = codewordBytes * 8
-	numCodewords := K * 8
+	const codewordBits = 1024
+	subsetSizeBits := codewordBits / K
+	// infer numCodewords from any non-empty packet
+	var pktLen int
+	for _, p := range interleavedPackets {
+		if len(p) > 0 {
+			pktLen = len(p)
+			break
+		}
+	}
+	if pktLen == 0 {
+		return nil, nil, errors.New("all packets missing")
+	}
+	totalBits := pktLen * 8
+	if totalBits%subsetSizeBits != 0 {
+		return nil, nil, errors.New("packet size invalid for K")
+	}
+	numCodewords := totalBits / subsetSizeBits
 
+	// unpack packets
 	packetsAsBits := make([][]bool, K)
 	present := make([]bool, K)
 	for i, packet := range interleavedPackets {
 		if len(packet) == 0 {
-			present[i] = false
 			continue
 		}
-		if len(packet) != outputPacketSizeBytes {
-			return nil, nil, errors.New("invalid packet size for packet")
-		}
 		present[i] = true
-		bits := make([]bool, outputPacketSizeBytes*8)
+		bits := make([]bool, len(packet)*8)
 		for j, b := range packet {
 			for bit := 0; bit < 8; bit++ {
-				bits[j*8+bit] = (b>>bit)&1 == 1
+				bits[j*8+bit] = ((b >> bit) & 1) == 1
 			}
 		}
 		packetsAsBits[i] = bits
 	}
 
-	subsetSizeBits := codewordBits / K
+	// gather shuffled bits and mask per codeword
 	shuffledBits := make([][]bool, numCodewords)
 	shuffledMask := make([][]bool, numCodewords)
 	for cwIdx := 0; cwIdx < numCodewords; cwIdx++ {
@@ -1595,6 +1777,7 @@ func DeinterleaveAndReassembleKnown(interleavedPackets [][]byte, randomMap []int
 		shuffledMask[cwIdx] = sm
 	}
 
+	// de-shuffle
 	inv := invertMap(randomMap)
 	bits := make([][]bool, numCodewords)
 	masks := make([][]bool, numCodewords)
@@ -1610,84 +1793,6 @@ func DeinterleaveAndReassembleKnown(interleavedPackets [][]byte, randomMap []int
 		masks[cwIdx] = m
 	}
 	return bits, masks, nil
-}
-
-// buildPolarColumns constructs the N columns of G = F^{\otimes n} used by the encoder.
-
-// solveGF2FullRank solves A x = b over GF(2), where A is MxK with rank K.
-// solveGF2FullRank removed; using precomputed inverse approach for performance.
-
-// Decoder holds the state for the successive cancellation decoder.
-type Decoder struct {
-	n         int // log2(N)
-	codewordN int // N
-	frozenSet map[int]struct{}
-	bitIdx    int // Tracks the current global bit index being decoded
-}
-
-// NewDecoder initializes a new Decoder.
-func NewDecoder(n int, frozenSet map[int]struct{}) *Decoder {
-	codewordN := 1 << n
-	return &Decoder{
-		n:         n,
-		codewordN: codewordN,
-		frozenSet: frozenSet,
-		bitIdx:    0,
-	}
-}
-
-// f performs the check node operation using the min-sum approximation.
-func f(a, b float64) float64 {
-	return math.Copysign(1.0, a) * math.Copysign(1.0, b) * math.Min(math.Abs(a), math.Abs(b))
-}
-
-// g performs the repetition node operation in the LLR domain.
-func g(a, b float64, u int) float64 {
-	if u == 0 {
-		return a + b
-	}
-	return b - a
-}
-
-func (d *Decoder) decodeRecursive(llrs []float64) []int {
-	n := len(llrs)
-	if n == 1 {
-		var decision int
-		if _, isFrozen := d.frozenSet[d.bitIdx]; isFrozen {
-			decision = 0
-		} else {
-			if llrs[0] >= 0 {
-				decision = 0
-			} else {
-				decision = 1
-			}
-		}
-		d.bitIdx++
-		return []int{decision}
-	}
-	half := n / 2
-	fllr := make([]float64, half)
-	for i := 0; i < half; i++ {
-		fllr[i] = f(llrs[i], llrs[i+half])
-	}
-	u1 := d.decodeRecursive(fllr)
-	gllr := make([]float64, half)
-	for i := 0; i < half; i++ {
-		gllr[i] = g(llrs[i], llrs[i+half], u1[i])
-	}
-	u2 := d.decodeRecursive(gllr)
-	u := make([]int, n)
-	for i := 0; i < half; i++ {
-		u[i] = u1[i] ^ u2[i]
-		u[i+half] = u2[i]
-	}
-	return u
-}
-
-// Decode runs SC decoding on the provided LLR vector.
-func (d *Decoder) Decode(receivedCodeword []float64) []int {
-	d.bitIdx = 0
-	return d.decodeRecursive(receivedCodeword)
 }
 
 // bitReverseN returns the integer formed by reversing the lower n bits of x.

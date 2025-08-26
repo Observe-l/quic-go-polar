@@ -23,6 +23,7 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 
 	// Reset decode metrics for a clean run
 	fec.ResetPolarDecodeStats()
+	fec.ResetPolarPerfStats()
 
 	// Load file
 	src, err := os.ReadFile(srcPath)
@@ -156,11 +157,18 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 
 	total := encTotal + decTotal
 	stats := fec.GetPolarDecodeStats()
+	p := fec.GetPolarPerfBreakdown()
 	t.Logf("Polar encode time (total): %v", encTotal)
 	t.Logf("Polar decode time (total) [%d drops of 32, %d bits]: %v", drop_num, numDataBits, decTotal)
 	t.Logf("Total time: %v", total)
 	t.Logf("Polar warm decode: total=%v, codewords=%d, avg warm per CW=%v", stats.WarmTotal, stats.WarmCodewords, stats.AvgWarmPerCW)
 	t.Logf("Polar cold decode: total=%v, codewords=%d, avg cold per CW=%v", stats.ColdTotal, stats.ColdCodewords, stats.AvgColdPerCW)
+	t.Logf("Polar phase breakdown: inv builds=%d total=%v avg/build=%v | Bbuild=%v, Mul=%v, Pack=%v | batches=%d totalCW=%d coldBatchCW=%d warmAvg/CW=%v coldAmort/CW=%v",
+		p.InvBuilds, p.InvBuildTotal, p.AvgInvPerBuild, p.BBuildTotal, p.MulTotal, p.PackTotal,
+		p.Batches, p.TotalCodewords, p.TotalColdBatchCWs, p.WarmAvgPerCW, p.ColdAmortizedPerCW)
 	fmt.Printf("Polar encode(total)=%v, decode(total)=%v, total=%v\n", encTotal, decTotal, total)
 	fmt.Printf("Polar warm: total=%v, CWs=%d, avgWarmPerCW=%v | cold: total=%v, CWs=%d, avgColdPerCW=%v\n", stats.WarmTotal, stats.WarmCodewords, stats.AvgWarmPerCW, stats.ColdTotal, stats.ColdCodewords, stats.AvgColdPerCW)
+	fmt.Printf("Polar phases: inv builds=%d total=%v avg/build=%v | Bbuild=%v, Mul=%v, Pack=%v | batches=%d totalCW=%d coldBatchCW=%d warmAvg/CW=%v coldAmort/CW=%v\n",
+		p.InvBuilds, p.InvBuildTotal, p.AvgInvPerBuild, p.BBuildTotal, p.MulTotal, p.PackTotal,
+		p.Batches, p.TotalCodewords, p.TotalColdBatchCWs, p.WarmAvgPerCW, p.ColdAmortizedPerCW)
 }
