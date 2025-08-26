@@ -8,6 +8,7 @@ import (
 	"math/bits"
 	"math/rand"
 	"os"
+	"time"
 )
 
 // cache for info columns of G to avoid recomputation across batches
@@ -49,6 +50,58 @@ var (
 	cachedPacketLUTK      int
 	cachedPacketLUTMapRef []int
 )
+
+// --- Decode metrics (warm vs cold) ---
+// A "warm" decode means the inverse for the current loss mask was found in cache.
+// A "cold" decode means we built and cached a new inverse.
+var polarDecodeMetrics struct {
+	warmTotal time.Duration
+	coldTotal time.Duration
+	warmCWs   int
+	coldCWs   int
+}
+
+// PolarDecodeStats is an exported snapshot of decode metrics.
+type PolarDecodeStats struct {
+	WarmTotal     time.Duration
+	ColdTotal     time.Duration
+	WarmCodewords int
+	ColdCodewords int
+	AvgWarmPerCW  time.Duration
+	AvgColdPerCW  time.Duration
+}
+
+// GetPolarDecodeStats returns a snapshot of current warm/cold decode metrics.
+func GetPolarDecodeStats() PolarDecodeStats {
+	avgCold := time.Duration(0)
+	avgWarm := time.Duration(0)
+	if polarDecodeMetrics.coldCWs > 0 {
+		// average cold time per codeword
+		avgCold = time.Duration(int64(polarDecodeMetrics.coldTotal) / int64(polarDecodeMetrics.coldCWs))
+	}
+	if polarDecodeMetrics.warmCWs > 0 {
+		// average warm time per codeword
+		avgWarm = time.Duration(int64(polarDecodeMetrics.warmTotal) / int64(polarDecodeMetrics.warmCWs))
+	}
+	return PolarDecodeStats{
+		WarmTotal:     polarDecodeMetrics.warmTotal,
+		ColdTotal:     polarDecodeMetrics.coldTotal,
+		WarmCodewords: polarDecodeMetrics.warmCWs,
+		ColdCodewords: polarDecodeMetrics.coldCWs,
+		AvgWarmPerCW:  avgWarm,
+		AvgColdPerCW:  avgCold,
+	}
+}
+
+// ResetPolarDecodeStats clears accumulated decode metrics.
+func ResetPolarDecodeStats() {
+	polarDecodeMetrics = struct {
+		warmTotal time.Duration
+		coldTotal time.Duration
+		warmCWs   int
+		coldCWs   int
+	}{}
+}
 
 func getInfoColsAndG(n int, encodingIndex []int, numDataBits int) ([][]bool, []int) {
 	if cachedGcols != nil && cachedPolarN == n && len(cachedInfoCols) == numDataBits {
@@ -1047,10 +1100,12 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		return Out
 	}
 
+	// Check cache
 	if e, ok := invCacheMap[struct {
 		mask  uint32
 		kinfo int
 	}{mask: mask, kinfo: numDataBits}]; ok {
+		tStart := time.Now()
 		invAsqPacked := e.inv
 		usedRows := e.usedRows
 		// Build B directly from packets using cached rowInfo when available
@@ -1120,6 +1175,9 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			}
 			out[i] = bts
 		}
+		// metrics: warm path
+		polarDecodeMetrics.warmTotal += time.Since(tStart)
+		polarDecodeMetrics.warmCWs += numCW
 		return out, nil
 	}
 	// Row selection: try a fast greedy assignment using (r & j)==j; fall back to packed-basis selection.
@@ -1228,6 +1286,7 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			Asq[i] = row
 		}
 	}
+	tStart := time.Now()
 	invAsqPacked, ok := invertBoolMatrixGF2Packed(Asq)
 	if !ok {
 		return nil, errors.New("polar erasure inversion failed")
@@ -1310,6 +1369,9 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		}
 		out[i] = bts
 	}
+	// metrics: cold path
+	polarDecodeMetrics.coldTotal += time.Since(tStart)
+	polarDecodeMetrics.coldCWs += numCW
 	return out, nil
 }
 
