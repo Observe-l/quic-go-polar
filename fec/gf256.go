@@ -6,12 +6,14 @@ var expTable [512]byte
 var logTable [256]byte
 
 func init() {
-	// build exp and log tables
+	// Build exp and log tables using a primitive generator g=0x03 under AES polynomial 0x11b.
+	// This ensures all 255 non-zero elements are covered.
 	exp := byte(1)
 	for i := 0; i < 255; i++ {
 		expTable[i] = exp
 		logTable[exp] = byte(i)
-		exp = xtime(exp)
+		// multiply by 3: (x*2) ^ x under GF(2)
+		exp = xtime(exp) ^ exp
 	}
 	for i := 255; i < 512; i++ {
 		expTable[i] = expTable[i-255]
@@ -40,3 +42,7 @@ func gf256Inv(a byte) byte {
 	}
 	return expTable[255-int(logTable[a])]
 }
+
+// Test helpers (exported) to access tables in tests without reimplementing
+func GF256Exp(i int) byte  { return expTable[i%255] }
+func GF256Log(a byte) byte { return logTable[a] }

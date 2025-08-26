@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"hash/crc32"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -22,8 +21,14 @@ var (
 		mask  uint32
 		kinfo int
 	}]struct {
-		inv      [][]uint64
-		usedRows []int
+		inv         [][]uint64
+		usedRows    []int
+		subsetBytes int
+		// Per-selected-row metadata to speed RHS building on warm path
+		rowInfo []struct {
+			subset, byteOff int
+			bitMask         byte
+		}
 	})
 	// Cached random map to keep interleaver stable across batches (enables cache hits)
 	cachedRandMap  []int
@@ -161,21 +166,6 @@ func buildInterleavePlan(randomMap []int, K int) [][][8]struct {
 	cachedPlanK = K
 	cachedPlan = plan
 	return plan
-}
-
-// computeMapCRC returns a CRC32 over the randomMap contents (LE uint32 per entry).
-func computeMapCRC(randomMap []int) uint32 {
-	h := crc32.NewIEEE()
-	buf := make([]byte, 4)
-	for _, v := range randomMap {
-		u := uint32(v)
-		buf[0] = byte(u)
-		buf[1] = byte(u >> 8)
-		buf[2] = byte(u >> 16)
-		buf[3] = byte(u >> 24)
-		_, _ = h.Write(buf)
-	}
-	return h.Sum32()
 }
 
 // getPacketLUT builds or returns a cached fused encode-to-packets LUT.
@@ -976,8 +966,6 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 	K := len(interleavedPackets)
 	const polarN = 10
 	// We route both loss and no-loss cases through the packed algebraic path for speed and consistency.
-	// Build info columns
-	Gcols, _ := getInfoColsAndG(polarN, encodingIndex, numDataBits)
 	N := 1 << polarN
 	// Build presence and known rows using inverse map
 	subsetSizeBits := N / K
@@ -1005,18 +993,30 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		totalBits := pktLen * 8
 		numCW = totalBits / subsetSizeBits
 		wordsCW := (numCW + 63) / 64
-		B = make([][]uint64, numDataBits)
+		subsetBytes := subsetSizeBits / 8
+		// Precompute tuple (subset, byteOff, bitMask) per used row
+		type sbm struct {
+			subset, byteOff int
+			bitMask         byte
+		}
+		rowInfo := make([]sbm, numDataBits)
 		for c := 0; c < numDataBits; c++ {
 			r := usedRows[c]
 			s := inv[r]
 			subset := s / subsetSizeBits
 			within := s % subsetSizeBits
+			rowInfo[c] = sbm{subset: subset, byteOff: within >> 3, bitMask: 1 << uint(within&7)}
+		}
+		B = make([][]uint64, numDataBits)
+		for c := 0; c < numDataBits; c++ {
+			info := rowInfo[c]
 			row := make([]uint64, wordsCW)
-			if present[subset] {
-				pkt := interleavedPackets[subset]
+			if present[info.subset] {
+				pkt := interleavedPackets[info.subset]
+				base := info.byteOff
 				for cw := 0; cw < numCW; cw++ {
-					bitIdx := cw*subsetSizeBits + within
-					if ((pkt[bitIdx>>3] >> uint(bitIdx&7)) & 1) == 1 {
+					idx := cw*subsetBytes + base
+					if pkt[idx]&info.bitMask != 0 {
 						row[cw>>6] |= 1 << uint(cw&63)
 					}
 				}
@@ -1025,21 +1025,13 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		}
 		return B, numCW
 	}
-	// Check cache
-	if e, ok := invCacheMap[struct {
-		mask  uint32
-		kinfo int
-	}{mask: mask, kinfo: numDataBits}]; ok {
-		invAsqPacked := e.inv
-		usedRows := e.usedRows
-		// Build B directly from packets
-		B, numCW := buildB(usedRows)
-		wordsCW := (numCW + 63) / 64
-		Out := make([][]uint64, numDataBits)
-		for i := 0; i < numDataBits; i++ {
+	// Helper: compute Out = inv * B over GF(2) (single-threaded for fair comparison)
+	computeOut := func(inv [][]uint64, B [][]uint64, wordsCW int, k int) [][]uint64 {
+		Out := make([][]uint64, k)
+		for i := 0; i < k; i++ {
 			acc := make([]uint64, wordsCW)
-			for pb := 0; pb < len(invAsqPacked[i]); pb++ {
-				m := invAsqPacked[i][pb]
+			for pb := 0; pb < len(inv[i]); pb++ {
+				m := inv[i][pb]
 				for m != 0 {
 					tz := bits.TrailingZeros64(m)
 					col := (pb << 6) + tz
@@ -1052,6 +1044,52 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 			}
 			Out[i] = acc
 		}
+		return Out
+	}
+
+	if e, ok := invCacheMap[struct {
+		mask  uint32
+		kinfo int
+	}{mask: mask, kinfo: numDataBits}]; ok {
+		invAsqPacked := e.inv
+		usedRows := e.usedRows
+		// Build B directly from packets using cached rowInfo when available
+		var B [][]uint64
+		var numCW int
+		if e.rowInfo != nil && e.subsetBytes > 0 {
+			// warm fast path with precomputed offsets
+			// infer num codewords
+			var pktLen int
+			for i := 0; i < K; i++ {
+				if present[i] {
+					pktLen = len(interleavedPackets[i])
+					break
+				}
+			}
+			totalBits := pktLen * 8
+			numCW = totalBits / subsetSizeBits
+			wordsCW := (numCW + 63) / 64
+			B = make([][]uint64, numDataBits)
+			for c := 0; c < numDataBits; c++ {
+				info := e.rowInfo[c]
+				row := make([]uint64, wordsCW)
+				if present[info.subset] {
+					pkt := interleavedPackets[info.subset]
+					base := info.byteOff
+					for cw := 0; cw < numCW; cw++ {
+						idx := cw*e.subsetBytes + base
+						if pkt[idx]&info.bitMask != 0 {
+							row[cw>>6] |= 1 << uint(cw&63)
+						}
+					}
+				}
+				B[c] = row
+			}
+		} else {
+			B, numCW = buildB(usedRows)
+		}
+		wordsCW := (numCW + 63) / 64
+		Out := computeOut(invAsqPacked, B, wordsCW, numDataBits)
 		// Pack
 		allDataBits := make([]int, 0, numCW*numDataBits)
 		for cw := 0; cw < numCW; cw++ {
@@ -1084,80 +1122,145 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		}
 		return out, nil
 	}
-	// Deterministic row selection independent of number of known rows.
-	// Build a KxK basis by scanning all rows and adding present rows that increase rank.
-	packedCols, _ := getPackedInfoCols(polarN, encodingIndex, numDataBits)
-	wordsK := (numDataBits + 63) / 64
-	basisRows := make([][]uint64, 0, numDataBits)
-	basisPivot := make([]int, 0, numDataBits)
-	usedRows := make([]int, 0, numDataBits)
-	// helper: test bit in packed column c at row r
-	getColBit := func(c, r int) bool { w := r >> 6; b := uint(r & 63); return ((packedCols[c][w] >> b) & 1) == 1 }
-	for r := 0; r < N && len(basisRows) < numDataBits; r++ {
-		// skip if this row is not present
-		s := inv[r]
+	// Row selection: try a fast greedy assignment using (r & j)==j; fall back to packed-basis selection.
+	Gcols, infoCols := getInfoColsAndG(polarN, encodingIndex, numDataBits)
+	// Compute known row indices once
+	presentRow := make([]bool, N)
+	for i := 0; i < N; i++ {
+		s := inv[i]
 		subset := s / subsetSizeBits
-		if !present[subset] {
-			continue
+		presentRow[i] = present[subset]
+	}
+	knownRowIdx := make([]int, 0, N)
+	for r := 0; r < N; r++ {
+		if presentRow[r] {
+			knownRowIdx = append(knownRowIdx, r)
 		}
-		// build row vector across K columns
-		v := make([]uint64, wordsK)
-		for c := 0; c < numDataBits; c++ {
-			if getColBit(c, r) {
-				v[c>>6] |= 1 << uint(c&63)
+	}
+	// Greedy mapping from columns to known rows
+	usedRows := make([]int, numDataBits)
+	for i := 0; i < numDataBits; i++ {
+		usedRows[i] = -1
+	}
+	usedFlag := make([]bool, len(knownRowIdx))
+	for c := 0; c < numDataBits; c++ {
+		j := infoCols[c]
+		for ridx, r := range knownRowIdx {
+			if usedFlag[ridx] {
+				continue
 			}
-		}
-		// eliminate using existing basis
-		for i := 0; i < len(basisRows); i++ {
-			pcol := basisPivot[i]
-			if ((v[pcol>>6] >> uint(pcol&63)) & 1) == 1 {
-				for w := 0; w < wordsK; w++ {
-					v[w] ^= basisRows[i][w]
-				}
-			}
-		}
-		// find pivot in v
-		pivot := -1
-		for w := 0; w < wordsK; w++ {
-			if v[w] != 0 {
-				tz := bits.TrailingZeros64(v[w])
-				pivot = (w << 6) + tz
+			if (r & j) == j {
+				usedRows[c] = r
+				usedFlag[ridx] = true
 				break
 			}
 		}
-		if pivot == -1 {
-			continue
-		}
-		// normalize by XORing to clear any future conflicts (we keep as-is; elimination handles it)
-		basisRows = append(basisRows, v)
-		basisPivot = append(basisPivot, pivot)
-		usedRows = append(usedRows, r)
 	}
-	if len(usedRows) != numDataBits {
-		return nil, errors.New("insufficient rank for erasure recovery")
-	}
-	// Build Asq (KxK) only from selected rows for inversion
-	Asq := make([][]bool, numDataBits)
+	haveAll := true
 	for i := 0; i < numDataBits; i++ {
-		r := usedRows[i]
-		row := make([]bool, numDataBits)
-		for c := 0; c < numDataBits; c++ {
-			row[c] = Gcols[c][r]
+		if usedRows[i] == -1 {
+			haveAll = false
+			break
 		}
-		Asq[i] = row
+	}
+	var Asq [][]bool
+	if haveAll {
+		Asq = make([][]bool, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			r := usedRows[i]
+			row := make([]bool, numDataBits)
+			for c := 0; c < numDataBits; c++ {
+				row[c] = Gcols[c][r]
+			}
+			Asq[i] = row
+		}
+	} else {
+		// Fallback: basis selection via packed columns
+		packedCols, _ := getPackedInfoCols(polarN, encodingIndex, numDataBits)
+		wordsK := (numDataBits + 63) / 64
+		basisRows := make([][]uint64, 0, numDataBits)
+		basisPivot := make([]int, 0, numDataBits)
+		usedRows = usedRows[:0]
+		getColBit := func(c, r int) bool { w := r >> 6; b := uint(r & 63); return ((packedCols[c][w] >> b) & 1) == 1 }
+		for _, r := range knownRowIdx {
+			if len(basisRows) >= numDataBits {
+				break
+			}
+			v := make([]uint64, wordsK)
+			for c := 0; c < numDataBits; c++ {
+				if getColBit(c, r) {
+					v[c>>6] |= 1 << uint(c&63)
+				}
+			}
+			for i := 0; i < len(basisRows); i++ {
+				pcol := basisPivot[i]
+				if ((v[pcol>>6] >> uint(pcol&63)) & 1) == 1 {
+					for w := 0; w < wordsK; w++ {
+						v[w] ^= basisRows[i][w]
+					}
+				}
+			}
+			pivot := -1
+			for w := 0; w < wordsK; w++ {
+				if v[w] != 0 {
+					tz := bits.TrailingZeros64(v[w])
+					pivot = (w << 6) + tz
+					break
+				}
+			}
+			if pivot == -1 {
+				continue
+			}
+			basisRows = append(basisRows, v)
+			basisPivot = append(basisPivot, pivot)
+			usedRows = append(usedRows, r)
+		}
+		if len(usedRows) != numDataBits {
+			return nil, errors.New("insufficient rank for erasure recovery")
+		}
+		Asq = make([][]bool, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			r := usedRows[i]
+			row := make([]bool, numDataBits)
+			for c := 0; c < numDataBits; c++ {
+				row[c] = Gcols[c][r]
+			}
+			Asq[i] = row
+		}
 	}
 	invAsqPacked, ok := invertBoolMatrixGF2Packed(Asq)
 	if !ok {
 		return nil, errors.New("polar erasure inversion failed")
 	}
-	// usedRows already set by basis selection
+	// Cache inverse, used rows, and per-row metadata for warm RHS builds
+	// Precompute rowInfo
+	subsetBytes := subsetSizeBits / 8
+	rowInfo := make([]struct {
+		subset, byteOff int
+		bitMask         byte
+	}, numDataBits)
+	for c := 0; c < numDataBits; c++ {
+		r := usedRows[c]
+		s := inv[r]
+		subset := s / subsetSizeBits
+		within := s % subsetSizeBits
+		rowInfo[c] = struct {
+			subset, byteOff int
+			bitMask         byte
+		}{subset: subset, byteOff: within >> 3, bitMask: 1 << uint(within&7)}
+	}
 	invCacheMap[struct {
 		mask  uint32
 		kinfo int
 	}{mask: mask, kinfo: numDataBits}] = struct {
-		inv      [][]uint64
-		usedRows []int
-	}{inv: invAsqPacked, usedRows: usedRows}
+		inv         [][]uint64
+		usedRows    []int
+		subsetBytes int
+		rowInfo     []struct {
+			subset, byteOff int
+			bitMask         byte
+		}
+	}{inv: invAsqPacked, usedRows: usedRows, subsetBytes: subsetBytes, rowInfo: rowInfo}
 	// Build B and batch solve
 	B, numCW := buildB(usedRows)
 	wordsCW := (numCW + 63) / 64
@@ -1783,13 +1886,35 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 				usedRows[i] = knownRowIdx[pr[i]]
 			}
 		}
+		// Precompute rowInfo metadata for warm RHS builds
+		subsetBytes := subsetSizeBits / 8
+		inv := invertMap(randomMap)
+		rowInfo := make([]struct {
+			subset, byteOff int
+			bitMask         byte
+		}, numDataBits)
+		for c := 0; c < numDataBits; c++ {
+			r := usedRows[c]
+			s := inv[r]
+			subset := s / subsetSizeBits
+			within := s % subsetSizeBits
+			rowInfo[c] = struct {
+				subset, byteOff int
+				bitMask         byte
+			}{subset: subset, byteOff: within >> 3, bitMask: 1 << uint(within&7)}
+		}
 		invCacheMap[struct {
 			mask  uint32
 			kinfo int
 		}{mask: mask, kinfo: numDataBits}] = struct {
-			inv      [][]uint64
-			usedRows []int
-		}{inv: invAsqPacked, usedRows: usedRows}
+			inv         [][]uint64
+			usedRows    []int
+			subsetBytes int
+			rowInfo     []struct {
+				subset, byteOff int
+				bitMask         byte
+			}
+		}{inv: invAsqPacked, usedRows: usedRows, subsetBytes: subsetBytes, rowInfo: rowInfo}
 	}
 
 	// Determine which knownRowIdx rows were used in Asq
@@ -1830,7 +1955,6 @@ func DecodeAndRecoverFrames(interleavedPackets [][]byte, randomMap, encodingInde
 			for m != 0 {
 				tz := bits.TrailingZeros64(m)
 				col := (pb << 6) + tz
-				// XOR the whole word-vector for this column
 				brow := B[col]
 				for w := 0; w < wordsCW; w++ {
 					acc[w] ^= brow[w]

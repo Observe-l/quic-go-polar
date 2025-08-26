@@ -49,28 +49,49 @@ func recoverRLC(blk Block, data [][]byte, present []bool, parity [][]byte, coeff
 	if m == 0 {
 		return 0, nil
 	}
-	if m > len(parity) { // insufficient equations
-		return 0, nil
-	}
-	// Build matrix A (m x m)
-	A := make([][]byte, m)
-	for i := 0; i < m; i++ {
-		A[i] = make([]byte, m)
-		for j := 0; j < m; j++ {
-			A[i][j] = coeffs[i][missingIdx[j]]
+	// Collect available parity rows indices
+	avail := make([]int, 0, len(parity))
+	for i := 0; i < len(parity); i++ {
+		if i < len(parity) && parity[i] != nil {
+			avail = append(avail, i)
 		}
+	}
+	if len(avail) < m {
+		return 0, nil // insufficient equations
+	}
+	// Build rectangular matrix B (len(avail) x m) over missing columns
+	B := make([][]byte, len(avail))
+	for r := 0; r < len(avail); r++ {
+		row := make([]byte, m)
+		cr := coeffs[avail[r]]
+		for c := 0; c < m; c++ {
+			row[c] = cr[missingIdx[c]]
+		}
+		B[r] = row
+	}
+	// Select m independent rows via GF(256) row-echelon pivoting
+	sel, rank := gf256SelectIndependentRows(B)
+	if rank < m {
+		return 0, nil // insufficient rank
+	}
+	// Build A from selected rows
+	A := make([][]byte, m)
+	for r := 0; r < m; r++ {
+		A[r] = make([]byte, m)
+		copy(A[r], B[sel[r]])
 	}
 	// Precompute RHS: parity minus known contributions
 	rhs := make([][]byte, m)
-	for i := 0; i < m; i++ {
-		r := make([]byte, blk.ChunkLen)
-		copy(r, parity[i])
+	for r := 0; r < m; r++ {
+		pr := make([]byte, blk.ChunkLen)
+		copy(pr, parity[avail[sel[r]]])
+		cr := coeffs[avail[sel[r]]]
 		for j := 0; j < blk.K; j++ {
 			if present[j] {
-				gf256MulAcc(r, data[j], coeffs[i][j])
+				gf256MulAcc(pr, data[j], cr[j])
 			}
 		}
-		rhs[i] = r
+		rhs[r] = pr
 	}
 	invA, ok := gf256InvertMatrix(A)
 	if !ok {
@@ -83,8 +104,8 @@ func recoverRLC(blk Block, data [][]byte, present []bool, parity [][]byte, coeff
 	}
 	for pos := 0; pos < blk.ChunkLen; pos++ {
 		col := make([]byte, m)
-		for i := 0; i < m; i++ {
-			col[i] = rhs[i][pos]
+		for r := 0; r < m; r++ {
+			col[r] = rhs[r][pos]
 		}
 		x := gf256MatVec(invA, col)
 		for i := 0; i < m; i++ {
@@ -170,4 +191,60 @@ func gf256MatVec(A [][]byte, x []byte) []byte {
 		y[i] = v
 	}
 	return y
+}
+
+// Select up to m independent rows from B using Gaussian elimination, returning selected indices and rank.
+func gf256SelectIndependentRows(B [][]byte) ([]int, int) {
+	rows := len(B)
+	if rows == 0 {
+		return nil, 0
+	}
+	cols := len(B[0])
+	// Make a working copy
+	M := make([][]byte, rows)
+	for i := 0; i < rows; i++ {
+		M[i] = make([]byte, cols)
+		copy(M[i], B[i])
+	}
+	idx := make([]int, rows)
+	for i := 0; i < rows; i++ {
+		idx[i] = i
+	}
+	sel := make([]int, 0, cols)
+	r := 0
+	for c := 0; c < cols && r < rows; c++ {
+		pivot := -1
+		for i := r; i < rows; i++ {
+			if M[i][c] != 0 {
+				pivot = i
+				break
+			}
+		}
+		if pivot == -1 {
+			continue
+		}
+		M[r], M[pivot] = M[pivot], M[r]
+		idx[r], idx[pivot] = idx[pivot], idx[r]
+		// scale pivot row to make M[r][c]==1
+		inv := gf256Inv(M[r][c])
+		for j := c; j < cols; j++ {
+			M[r][j] = gf256Mul(M[r][j], inv)
+		}
+		// eliminate other rows
+		for i := 0; i < rows; i++ {
+			if i == r {
+				continue
+			}
+			f := M[i][c]
+			if f == 0 {
+				continue
+			}
+			for j := c; j < cols; j++ {
+				M[i][j] ^= gf256Mul(M[r][j], f)
+			}
+		}
+		sel = append(sel, idx[r])
+		r++
+	}
+	return sel, len(sel)
 }

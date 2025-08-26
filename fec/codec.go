@@ -10,6 +10,7 @@ type Scheme string
 const (
 	XOR   Scheme = "xor"
 	RLC   Scheme = "rlc"
+	RS    Scheme = "rs"
 	Polar Scheme = "polar"
 	None  Scheme = "none"
 )
@@ -44,6 +45,8 @@ func Encode(s Scheme, blk Block, data [][]byte) (*EncodeResult, error) {
 		return encodeXOR(blk, data)
 	case RLC:
 		return encodeRLC(blk, data)
+	case RS:
+		return encodeRS(blk, data)
 	case Polar:
 		return encodePolar(blk, data)
 	case None:
@@ -65,6 +68,8 @@ func Recover(s Scheme, blk Block, data [][]byte, present []bool, parity [][]byte
 		return recoverXOR(blk, data, present, parity)
 	case RLC:
 		return recoverRLC(blk, data, present, parity, coeffs)
+	case RS:
+		return recoverRS(blk, data, present, parity)
 	case Polar:
 		return recoverPolar(blk, data, present, parity, meta)
 	case None:

@@ -1,6 +1,6 @@
 # Polar Encoder and Decoder for Packet-Level FEC
 
-Date: 2025-08-25
+Date: 2025-08-26
 
 This note summarizes the encoder and decoder we implemented for a binary polar-style code with packet-level bit interleaving. It focuses on the core theory, the practical packet-loss mechanism, performance optimizations, and complexity, with comparisons to common packet-level FEC schemes.
 
@@ -24,225 +24,179 @@ This note summarizes the encoder and decoder we implemented for a binary polar-s
 | $\mathbf{B}$ | RHS matrix built directly from received packets |
 | $M$ | Loss mask over packets (bitmask of missing packets) |
 | $W$ | Machine word size in bits for packed operations (e.g., $W=64$ on x86_64/ARM64) |
-| $T$ | Number of codewords processed in one batch |
-| $R$ | Number of parity packets (when applicable in other FECs) |
-| $B$ | Total source data size (bits) compared across schemes |
-| $S_{\text{pkt}}$ | Payload bits per packet/symbol for packet-level FEC (RS/XOR/RLC) |
+# Polar Coding with Packet-Level Interleaving for Erasure Recovery: An IEEE-Style Exposition
 
----
+Date: 2025-08-26
 
-## 1. Encoder
+Abstract—We present a binary polar-coding pipeline tailored to packet-level erasure recovery via bit-level interleaving across K packets. The encoder uses a column-XOR realization of the polar transform fused with direct packet assembly; the decoder performs algebraic erasure recovery by selecting known rows of the transform and solving a packed GF(2) linear system batched across codewords. We derive encoder complexity Θ(QN^2/W) (word operations) and show warm-path decoder latency independent of the number of lost packets for a fixed loss mask. Implementation details enable high throughput via word packing and caching. Empirical measurements validate the analysis.
 
-### 1.1 Theory
+Index Terms—Polar codes, erasure decoding, GF(2), interleaving, forward error correction, packed bit operations.
 
-We use the binary polar transform with kernel $\mathsf{F} = \begin{bmatrix}1 & 0\\ 1 & 1\end{bmatrix}$ and generator
-$\mathsf{G}_N = \mathsf{F}^{\otimes n}$. Given an information set $\mathcal{I}$ (with $|\mathcal{I}|=Q\,N$) obtained from a reliability sequence, we form $\mathbf{u}\in\{0,1\}^N$ by placing the message bits at indices $\mathcal{I}$ and zeros elsewhere. The encoded codeword is
+## I. Introduction
+
+Polar coding [Arıkan] provides a structured binary transform with low-complexity encoding. We target a practical setting in which codewords are bit-interleaved across packets; packet loss induces erasures at known positions. Our contributions are: (i) an encoder that realizes the polar transform as a column-wise XOR superposition fused directly into packet buffers; (ii) an algebraic decoder over GF(2) that selects full-rank known rows and performs a batched solve; (iii) a complexity analysis evidencing $\Theta(QN^2/W)$ encoder cost and warm-path decoder latency invariant to loss count, given a fixed loss mask.
+
+## II. Notation and System Model
+
+ - Polar parameters: kernel $\mathsf{F}=\begin{bmatrix}1&0\\1&1\end{bmatrix}$, exponent $n$, length $N=2^n$.
+ - Reliability sequence and information set: $\mathcal{I}\subseteq[0{:}N{-}1],\ |\mathcal{I}|=Q\,N$, with rate $Q\in(0,1]$.
+ - Generator: $\mathsf{G}_N = \mathsf{F}^{\otimes n}$ (no bit-reversal inside $\mathsf{G}_N$); implementation aligns the given reliability sequence by bit-reversing indices.
+ - Interleaver: a fixed permutation $\pi:[0{:}N{-}1]\to[0{:}N{-}1]$.
+ - Packetization: $K$ packets; each codeword is split into $K$ equal subsets of $S=N/K$ bits. Packet $s$ stores, consecutively, the $s$-th subset for codewords $t=0,\dots,T{-}1$.
+ - Machine model: word size $W$ (e.g., 64). Packed GF(2) bitsets use $\lceil N/W\rceil$ words.
+
+Let $\mathbf{u}^{(t)}\in\{0,1\}^N$ denote the information vector for codeword index $t$ (zeros outside $\mathcal{I}$). The encoded codeword is
 $$
-\mathbf{x} = \mathbf{u}\,\mathsf{G}_N \in \{0,1\}^N.
+\mathbf{x}^{(t)} = \mathbf{u}^{(t)}\,\mathsf{G}_N.\tag{1}
 $$
-In practice, our reliability sequence is specified in the $\mathsf{B}_N\mathsf{F}^{\otimes n}$ domain; we align it to our $\mathsf{F}^{\otimes n}$ encoder by bit-reversing the indices (denoted $\mathrm{bitrev}_n(\cdot)$).
+The interleaver output $\pi(\mathbf{x}^{(t)})$ is partitioned into $K$ blocks of length $S$. Packet $s$ stores block $s$ at byte offset $t\cdot(S/8)$.
 
-For multiple codewords in a batch, we repeat this mapping. When no losses occur, a second application of $\mathsf{F}^{\otimes n}$ (the self-inverse butterfly) recovers $\mathbf{u}$ exactly.
+Loss model: a subset $\mathcal{S}_{\text{miss}}\subseteq\{0,\dots,K{-}1\}$ is erased (entire packets), known at the receiver.
 
-**Column-XOR equivalence.** Over GF(2), matrix-vector multiply can be written as an XOR of selected columns. Let $\mathsf{G}_N = [\mathbf{g}_0\;\mathbf{g}_1\;\dots\;\mathbf{g}_{N-1}]$ with columns $\mathbf{g}_j$. Then
+## III. Encoder
+
+### A. Column–XOR Realization
+
+Write $\mathsf{G}_N=[\mathbf{g}_0\;\mathbf{g}_1\;\cdots\;\mathbf{g}_{N-1}]$. Over GF(2), (1) equals
 $$
-\mathbf{x} = \mathbf{u}\,\mathsf{G}_N = \bigoplus_{j=0}^{N-1} u_j\,\mathbf{g}_j = \bigoplus_{j\in\mathcal{I}} u_j\,\mathbf{g}_j,
+\mathbf{x}^{(t)} = \bigoplus_{j=0}^{N-1} u^{(t)}_j\,\mathbf{g}_j = \bigoplus_{j\in\mathcal{I}} u^{(t)}_j\,\mathbf{g}_j,\tag{2}
 $$
-where $\oplus$ denotes bitwise XOR and $u_j\in\{0,1\}$. Thus, precomputing packed columns $\{\mathbf{g}_j\}_{j\in\mathcal{I}}$ and XORing those with $u_j=1$ produces exactly the polar codeword. Our fused encoder further maps these contributions through $\pi$ and straight into packet bytes.
+because $u^{(t)}_j\in\{0,1\}$ and addition is XOR. Thus encoding is the XOR superposition of those columns for which $u^{(t)}_j=1$.
 
-### 1.2 Packet-level interleaving and loss model
+Proposition 1 (Column-XOR equivalence). Precomputing packed columns $\{\mathbf{g}_j\}_{j\in\mathcal{I}}$ and XORing those with $u^{(t)}_j=1$ produces exactly $\mathbf{x}^{(t)}$.
 
-We apply a fixed bit-level permutation $\pi$ (the `randomMap`) to each codeword and split the permuted codeword into $K$ equal-sized subsets of $S=N/K$ bits. Subset $s\in\{0,\dots,K-1\}$ of codeword $t$ occupies a contiguous byte-range in packet $\mathbf{P}_s$ at offset proportional to $t$:
+Proof: Immediate from (2).
+
+### B. Fused Encode-to-Packets
+
+We avoid materializing $\mathbf{x}^{(t)}$ by composing (2) with interleaving and packet assembly. For each message byte position $b_y\in[0{:}(Q\,N)/8{-}1]$ and value $v\in[0{:}255]$, a LUT slice $\mathcal{L}[b_y,v]$ of length $N/8$ bytes encodes the XOR contribution across all $K$ subsets (concatenated). Encoding XORs $\mathcal{L}[b_y,v]$ at offset $t\cdot(N/8)$ into the $K$ packet buffers (strided by subset). Persistence keys the LUT by $(n,|\mathcal{I}|,K,\text{CRC}(\pi))$.
+
+### C. Encoder Complexity
+
+Let $H(\mathbf{u}^{(t)}_{\mathcal{I}})$ be the Hamming weight of information bits. The column-XOR encoder performs
 $$
-\text{subset}_s(t) = \big(\pi(\mathbf{x}^{(t)})\big)[\,sS : (s+1)S\,),\quad \mathbf{P}_s[\,t\cdot S : (t+1)S\,) \mathrel{\widehat{=}} \text{subset}_s(t),
+C_\text{col} = H(\mathbf{u}^{(t)}_{\mathcal{I}})\cdot (N/W) = \Theta\big(Q\,N^2/W\big)\quad\text{word XORs},\tag{3}
 $$
-where $\widehat{=}$ denotes bitwise packing to bytes. This spreads every codeword across all packets; dropping a subset of packets corresponds to erasures of known rows in the transform domain.
-
-The interleaver is persisted to disk so the mapping remains stable across runs, enabling cache hits for precomputed artifacts.
-
-### 1.3 Fused encode-to-packets (performance)
-
-Naïvely, one could materialize each codeword $\mathbf{x}$ and then copy bits into packets. We instead fuse encoding and packet assembly:
- - Precompute a packet-level look-up table (LUT) $\mathcal{L}[b_y, v]$ for each message byte position $b_y$ and byte value $v\in[0,255]$. Each LUT entry is a 128-byte vector (for $N=1024$) representing the XOR contribution across all $K$ subsets in permutation order.
- - Encoding a batch becomes: for each message byte, XOR the corresponding LUT row directly into the $K$ packet buffers at the codeword’s offset. We never materialize $\mathbf{x}$.
-
-We persist the LUT to disk keyed by $(n, |\mathcal{I}|, K)$ (equivalently $(n, Q, K)$ since $|\mathcal{I}|=Q\,N$) and a CRC of $\pi$, so warm runs skip heavy precomputation.
-
-### 1.4 Implementation techniques
-
-- Packed bit operations: generator columns are packed into `uint64` words; encoding reduces to word-wise XORs.
-- Interleave plan: for the non-fused path, a compact per-destination-byte plan avoids per-bit work.
-- Deterministic data layout: stable $\pi$ and fixed packet byte layouts allow aggressive caching and fast inner loops.
-- Persistence: `randomMap` and the packet LUT are saved/loaded to amortize setup cost.
-
-### 1.5 Complexity
-
-Recall $W$ denotes the machine word size in bits (typically $W=64$). When bitsets are packed into $\lceil N/W\rceil$ words, operations scale with $N/W$ rather than $N$.
-- Baseline encode via transform: $\Theta(N\log N)$ boolean operations per codeword (butterfly).
-- Column-XOR encode: $\Theta\!\big((Q\,N)\cdot N/W\big) = \Theta\!\big(Q\,N^2/W\big)$ word XORs per codeword.
-- Interleaving (naïve): $\Theta(N)$ bit moves per codeword; with a byte-wise plan, $\Theta(N/8)$ byte ops.
-- Fused encode-to-packets (ours): per codeword, $\Theta\!\big(((Q\,N)/8)\cdot (N/K)/8 \cdot K\big) = \Theta\!\big( Q\,N^2 / 64 \big)$ byte XORs, but with a small constant because $(N/K)/8$ is tiny (e.g., 4 bytes for $N{=}1024,K{=}32$). No intermediate codeword is materialized.
-
-Empirically (single thread, $N{=}1024$, $K{=}32$, $Q{=}1/8$ i.e., 128 info bits), total encode time is below decode time after fusion and persistence.
-
----
-
-## 2. Decoder
-
-### 2.1 Unified fast path (loss or no-loss)
-
-We route both loss and no-loss cases through the packed algebraic path for speed and a consistent performance profile. Conceptually, the no-loss case could apply the self-inverse butterfly on deinterleaved codewords ($\Theta(N\log N)$ per codeword). In practice, building the RHS directly from packets and applying the cached inverse achieves lower latency and avoids materializing codewords.
-
-### 2.2 Erasure model and algebraic recovery
-
-Let observed packets be indexed by $\mathcal{S}_\text{obs}\subseteq\{0,\dots,K-1\}$; missing packets are known erasures. Each received subset reveals a known row of $\mathbf{x}$ in the permuted domain. Using the inverse permutation $\pi^{-1}$, we map received subsets to a known-row set $\mathcal{R} \subseteq [0,\dots,N-1]$.
-
-Let $\mathcal{I}$ index the $Q\,N$ columns of interest in $\mathsf{G}_N$. We select a deterministic set of $Q\,N$ row indices $\mathcal{R}_\star\subseteq\mathcal{R}$ that yield a full-rank square matrix
+in the worst case (and on average for i.i.d. bits up to a 1/2 factor). The fused LUT encoder executes
 $$
-\mathbf{A} \stackrel{\mathrm{def}}{=} \mathsf{G}_N[\mathcal{R}_\star,\,\mathcal{I}] \in \{0,1\}^{(Q\,N)\times (Q\,N)}.
+C_\text{LUT,bytes} = \frac{Q\,N}{8}\cdot\frac{N}{8} = \frac{Q\,N^2}{64}\quad\text{byte XORs},\tag{4}
 $$
-We then form the RHS matrix $\mathbf{B}$ by reading bits directly from packets at the appropriate offsets (no intermediate codeword assembly):
+equivalently $\Theta(Q\,N^2/W)$ word ops up to constants. Note that (4) is independent of $K$ since
 $$
-\mathbf{B}[i, t] = \big(\text{subset of packet determined by } r_i \in \mathcal{R}_\star\big)[\,t\,],\quad t=0,\dots,T{-}1,
+\frac{N}{8} = \sum_{s=0}^{K-1} \tfrac{(N/K)}{8}.\tag{5}
 $$
-where $T$ is the number of codewords in the batch and $r_i$ is the $i$-th selected row. The information bits for the whole batch follow from the batched solve
+
+## IV. Decoder
+
+### A. Problem Formulation (Inputs/Outputs)
+
+Given a family of packets $\{\mathbf{P}_s\}_{s=0}^{K-1}$, where $\mathbf{P}_s$ is either a byte string or empty (erased), the goal is to reconstruct the sequence of messages $\{\mathbf{m}^{(t)}\}_{t=0}^{T-1}$, where $\mathbf{m}^{(t)}\in\{0,1\}^{Q\,N}$ are the information bits, packed as bytes (little-endian bit order within bytes). The mapping from packet bytes to known rows is determined by $\pi^{-1}$ and fixed offsets: for a selected row index $r_i$, let
 $$
-\mathbf{U}^\top = \mathbf{A}^{-1}\,\mathbf{B}^\top,\quad \mathbf{U}\in\{0,1\}^{T\times (Q\,N)}.
+\big(s_i, o_i, m_i\big) = \text{subset index, byte offset, and bit mask},\tag{6}
 $$
-All arithmetic is over GF(2) and is implemented with packed `uint64` words. We cache $(\mathbf{A}^{-1},\mathcal{R}_\star)$ keyed by (loss mask $M$, $Q\,N$) to make latency invariant to the exact number of erasures.
+so that the right-hand side (RHS) bits are read as
+$$
+\mathbf{B}[i,t] = \left(\mathbf{P}_{s_i}[\,t\cdot(S/8)+o_i\,] \;\&\; m_i\right)\neq 0.\tag{7}
+$$
+The batched recovery computes
+$$
+\mathbf{U}^\top = \mathbf{A}^{-1}\,\mathbf{B}^\top,\quad \mathbf{A}=\mathsf{G}_N[\mathcal{R}_\star,\mathcal{I}],\tag{8}
+$$
+where $\mathcal{R}_\star$ is a full-rank selection of $|\mathcal{I}|=Q\,N$ known rows induced by the non-erased packets.
 
-### 2.3 Implementation techniques
+### B. Unified Algebraic Decoder
 
-- Packed Gaussian elimination to invert $\mathbf{A}$ once per loss mask (or warm-load from cache). Complexity $\tilde{\Theta}((Q\,N)^3/W)$ bit ops.
-- Deterministic basis selection over received rows using packed columns from $\mathsf{G}_N$ ensures stability across drop rates.
-- Direct RHS synthesis from packets avoids deinterleaving and intermediate codeword storage.
-- Batched multiply-accumulate over GF(2) for $\mathbf{A}^{-1}\mathbf{B}$ amortizes work across codewords.
+We select $\mathcal{R}_\star$ deterministically from the set of known rows (e.g., by a greedy pivot rule compatible with the structure of $\mathsf{G}_N$) and invert $\mathbf{A}$ over GF(2) using packed Gaussian elimination. The inverse $\mathbf{A}^{-1}$ and the tuple list $\{(s_i,o_i,m_i)\}$ are cached per loss mask. For each batch we synthesize $\mathbf{B}$ by (7) and compute (8) via packed XOR MACs.
 
-*Cold vs. warm inversion.* "Cold inversion" refers to the first-time computation of $\mathbf{A}^{-1}$ for a particular loss mask $M$ (and rate $Q$, i.e., dimension $Q\,N$), performed via packed Gaussian elimination. We then cache both the selected row indices $\mathcal{R}_\star$ and $\mathbf{A}^{-1}$ in memory. Subsequent batches that encounter the same mask use a "warm" path that reuses the cached inverse at $O(1)$ setup cost (decode then dominated by the batched multiply). In this implementation we do not persist the inverse to disk; only the interleaver map and packet-level LUT are persisted.
+Remark (no-loss fast path): when no packets are erased, one may apply $\mathsf{F}^{\otimes n}$ (self-inverse) directly to $\pi(\mathbf{x}^{(t)})$ to obtain $\mathbf{u}^{(t)}$ and then extract the $Q\,N$ data indices. Our implementation routes both cases through the algebraic path for uniformity and cache reuse.
 
-### 2.4 Complexity
+### C. Decoder Complexity and Loss-Rate Invariance
 
-Let $T$ be the number of codewords in the batch.
-- Baseline (naïve) erasure recovery: deinterleave and materialize each codeword $\Rightarrow \Theta(T\cdot N)$ bit ops, then solve per codeword $\Theta((Q\,N)^2)$ with a precomputed inverse, or $\Theta((Q\,N)^3)$ without reuse.
-- Our optimized pipeline:
-  - Inversion (cold): $\tilde{\Theta}((Q\,N)^3/W)$ once per loss mask.
-  - Build $\mathbf{B}$: $\Theta(T\cdot Q\,N\cdot S / W)$ word ops by reading packet bytes directly at computed offsets.
-  - Batched multiply: $\Theta(T\cdot (Q\,N)^2 / W)$ word XORs.
+Let $T$ be the number of codewords in the batch. With packed word operations:
+$$
+	ext{Cold inversion: }\ \tilde{\Theta}\big((Q\,N)^3/W\big)\ \text{ once per loss mask},\tag{9}
+$$
+$$
+	ext{RHS build: }\ \Theta\big(T\,Q\,N\,S/W\big),\tag{10}
+$$
+$$
+	ext{Batched multiply: }\ \Theta\big(T\,(Q\,N)^2/W\big).\tag{11}
+$$
+Since $S=N/K$ is small for typical $K$, (11) dominates. For a fixed loss mask (warm path), decode latency depends on $Q,N,T,W$ and is independent of how many packets were lost, because (9) is amortized and (10)–(11) do not depend on the loss count once $\mathcal{R}_\star$ is fixed.
 
-Since $S=N/K$ is small (e.g., $32$ bits per subset byte-block for $N{=}1024,K{=}32$), RHS construction is inexpensive; the batched multiply dominates and scales linearly with $T$.
+Implementation notes: (i) cache $\mathbf{A}^{-1}$ and row tuples $(s_i,o_i,m_i)$ per mask to remove setup; (ii) synthesize $\mathbf{B}$ using (7) with no divides/modulo in the inner loop to improve cache locality.
 
----
+### D. Packet-Loss Analysis: Input Construction and Packet Repair
 
-## 3. Complexity comparison with common packet-level FEC
+We formalize how packet erasures induce known/unknown codeword positions and how the decoder constructs inputs and repairs missing packets.
 
-We compare encoder/decoder leading-order costs using the same symbols: $N$ (bits/codeword), $K$ (packets), $S=N/K$ (bits per subset), $Q$ (code rate), $T$ (codewords per batch), $R$ (parity packets, where applicable), and $W$ (machine word size; packed GF(2) operations process $W$ bits at once).
+1) Interleaver-induced row partition. Let $S=N/K$ and define the row index sets
+$$
+\mathcal{J}_s \triangleq \big\{ j\in[0{:}N{-}1] : \big\lfloor \pi(j)/S \big\rfloor = s \big\},\quad s\in\{0,\dots,K{-}1\}.
+$$
+Thus, after interleaving, packet $s$ carries exactly the $S$ bits at row indices $\mathcal{J}_s$ (for every codeword $t$).
 
-| Scheme | Encoder complexity | Decoder complexity | Notes |
+2) Loss mask and known rows. Let $\mathcal{M}\subseteq\{0,\dots,K{-}1\}$ be the set of erased packets and $\mathcal{R}_\mathrm{cv} = \{0,\dots,K{-}1\}\setminus\mathcal{M}$ the received set. The set of known row indices is
+$$
+\mathcal{R} \triangleq \bigcup_{s\in\mathcal{R}_\mathrm{cv}} \mathcal{J}_s\subseteq[0{:}N{-}1].
+$$
+The decoder selects a full-rank subset $\mathcal{R}_\star\subseteq\mathcal{R}$ with $|\mathcal{R}_\star|=|\mathcal{I}|=Q\,N$ (by a deterministic pivoting rule) and forms
+$$
+\mathbf{A} = \mathsf{G}_N[\mathcal{R}_\star,\mathcal{I}]\in\{0,1\}^{|\mathcal{I}|\times|\mathcal{I}|}.
+$$
+
+3) RHS construction from received packets. For each selected row index $r_i\in\mathcal{R}_\star$, we precompute a tuple $(s_i,o_i,m_i)$ such that, for codeword $t$, the interleaved bit $y^{(t)}_{r_i}$ is the $m_i$-masked bit of packet $s_i$ at byte offset $t\cdot(S/8)+o_i$. This yields the RHS per (7):
+$$
+\mathbf{B}[i,t] = \big(\mathbf{P}_{s_i}[\,t\cdot(S/8)+o_i\,] \;\&\; m_i\big)\neq 0.
+$$
+Note there are no contributions from erased packets: unknown rows are not part of $\mathcal{R}_\star$ and thus never appear on the RHS.
+
+4) Algebraic erasure solve (hard decisions). With $\mathbf{A}^{-1}$ cached per mask, we recover the information bits for all $t=0,\dots,T{-}1$ via
+$$
+\mathbf{U}^\top = \mathbf{A}^{-1}\,\mathbf{B}^\top,\qquad \mathbf{U}\in\{0,1\}^{|\mathcal{I}|\times T}.
+$$
+This is a deterministic GF(2) solve; unlike SC, we do not use likelihoods or LLRs (e.g., 0.5 for erasures). Erasures are treated as unknown variables eliminated from the equations; only received rows constrain the solution.
+
+5) Reconstructing missing packets. Let $\mathcal{J}_s$ denote the row set of missing packet $s\in\mathcal{M}$. The corresponding codeword bits for codeword $t$ satisfy
+$$
+\mathbf{y}^{(t)}_{\mathcal{J}_s} = \mathsf{G}_N[\mathcal{J}_s,\mathcal{I}]\;\mathbf{u}^{(t)}_{\mathcal{I}}.
+$$
+Two equivalent repair paths exist:
+
+- Message-first repair: compute $\mathbf{u}^{(t)}_{\mathcal{I}}$ as above and then form $\mathbf{y}^{(t)}_{\mathcal{J}_s}$ by multiplying $\mathsf{G}_N[\mathcal{J}_s,\mathcal{I}]$; write the $S$ recovered bits into packet $s$ at offset $t\cdot(S/8)$.
+
+- Direct repair from RHS: precompute the mask-specific repair matrix
+$$
+\mathbf{R}_s \triangleq \mathsf{G}_N[\mathcal{J}_s,\mathcal{I}]\;\mathbf{A}^{-1}\in\{0,1\}^{S\times |\mathcal{I}|},
+$$
+so that, for every codeword $t$,
+$$
+\mathbf{y}^{(t)}_{\mathcal{J}_s} = \mathbf{R}_s\;\mathbf{b}^{(t)},\qquad \mathbf{b}^{(t)} \equiv \mathbf{B}[\cdot,t].
+$$
+This avoids materializing $\mathbf{u}^{(t)}_{\mathcal{I}}$ and repairs packets directly from received bytes. $\{\mathbf{R}_s\}_{s\in\mathcal{M}}$ are cached per loss mask alongside $\mathbf{A}^{-1}$.
+
+Complexity. Warm-path repair via $\mathbf{R}_s\mathbf{b}^{(t)}$ costs $\Theta\big(T\,|\mathcal{I}|\,S/W\big)=\Theta\big(T\,Q\,N\,S/W\big)$ per missing $s$, matching the dominant terms in (10)–(11). The algebraic method succeeds whenever $\mathbf{A}$ is full-rank; if rank deficiency occurs (extreme loss patterns or high $Q$), the decoder may reselect pivots or defer until more packets arrive.
+
+Relation to SC. An SC decoder on a BEC commonly sets LLRs of erased positions to zero (i.e., probability 0.5) and proceeds sequentially. Here we exploit the linearity of the code over GF(2): known (received) rows yield linear equations, erased rows are unknowns, and we solve the resulting square system on the information set. This is optimal for erasures given sufficient independent equations, and it yields loss-rate–invariant warm-path latency as discussed in §IV-C.
+
+## V. Complexity Comparison
+
+| Scheme | Encoder | Decoder | Notes |
 |---|---|---|---|
-| Polar+interleave (ours), fused LUT | $\Theta\!\big(Q\,N^2/W\big)$ per codeword; no materialized codeword | Cold: $\tilde{\Theta}((Q\,N)^3/W)$ once per loss mask. Per batch: $\Theta\!\big(T\,(Q\,N)^2/W + T\,Q\,N\,S/W\big)$ | Inverse cached by (mask,$Q\,N$). RHS built directly from packets. |
-| Polar (naïve) + interleave | $\Theta(N\log N)$ per codeword + interleave | No-loss: $\Theta(N\log N)$ per codeword. Erasures: as above after deinterleave | Higher memory traffic; slower in practice. |
-| RS over GF($2^m$) | $\Theta(K\,R)$ finite-field ops per block | Erasures: typically $\Theta(K^2)$ per block (field ops); FFT-like speedups exist | MDS; coefficients over GF($2^m$); higher per-byte CPU. |
-| XOR parity (R=1) | $\Theta(K)$ XORs per block | Recover 1 loss: $\Theta(K)$ XORs | Very low cost; limited recovery to $R$. |
-| XOR parity (general R) | $\Theta(K\,R)$ XORs per block | Recover up to $R$ losses: $\Theta(K\,R)$ | Scales linearly; quickly grows for large $R$. |
-| RLC over GF(2) | $\Theta(K\,R/W)$ word ops per block | Gaussian elim $\tilde{\Theta}(K^3/W)$; amortize with batching | Requires coding vectors; random rank can fluctuate. |
-| RLC over GF(256) | $\Theta(K\,R)$ byte-field ops per block | $\tilde{\Theta}(K^3)$ field ops | Strong erasure recovery; higher arithmetic cost. |
+| Polar + interleave (fused) | $\Theta(Q\,N^2/W)$ per codeword | Cold: $\tilde{\Theta}((Q\,N)^3/W)$. Warm batch: $\Theta\big(T\,(Q\,N)^2/W + T\,Q\,N\,S/W\big)$ | Inverse and row tuples cached by loss mask. |
+| Polar (butterfly) + interleave | $\Theta(N\log N)$ + copy | No-loss: $\Theta(N\log N)$/cw; erasures: as left | More memory traffic. |
+| RS (GF$(2^m)$) | $\Theta(KR)$ | $\Theta(K^2)$ typical | MDS, heavier arithmetic. |
+| XOR parity | $\Theta(KR)$ | $\Theta(KR)$ | Limited to $R$ erasures. |
+| RLC (GF(2)) | $\Theta(KR/W)$ | $\tilde{\Theta}(K^3/W)$ | Needs coding vectors. |
 
-### Advantages and disadvantages
+Under equal data size $B$ and rate $Q$, the polar pipeline is linear in $B$ (constants depend on $N,W,Q$), whereas RS decoders are typically quadratic and RLC cubic.
 
-- Polar+interleave (ours)
-  - Advantages: pure GF(2) packed ops; no per-packet coefficients; caches keyed by loss mask; fused encoder minimizes memory traffic; predictable latency across drop rates.
-  - Disadvantages: not MDS; recovery depends on rank of selected rows; parameters tuned to $N=1024$ in this implementation.
-- RS codes
-  - Advantages: MDS; optimal erasure correction for given parity.
-  - Disadvantages: finite-field arithmetic overhead; coefficient management; can be CPU-heavy at high rates.
-- XOR parity
-  - Advantages: minimal CPU cost, trivial implementation.
-  - Disadvantages: very limited erasure tolerance (at most $R$ losses). Large $R$ becomes bandwidth-expensive.
-- RLC (GF(2)/GF(256))
-  - Advantages: flexible, near-MDS performance with sufficient field size; robust to patterns.
-  - Disadvantages: transmit coding vectors; decoding via elimination is $\tilde{\Theta}(K^3)$ (or $/W$ in GF(2)); rank variability.
+## VI. Experimental Illustration
 
-### When which scheme is preferable
+Setup: $N=1024$, $K=32$, Linux x86_64, single thread. Packets carry eight codewords per subset ($S/8=4$ bytes per codeword per packet). We varied $|\mathcal{I}|$ and loss masks across batches.
 
-- Low loss budgets (e.g., 1 loss) and tight CPU limits: XOR parity.
-- High optimality requirements with moderate $K$: RS codes.
-- Large, dynamic sets with unpredictable patterns and sufficient CPU: RLC.
-- Throughput-oriented binary pipelines with stable layout and strong caching: our Polar+interleave method tends to outperform in CPU efficiency while sustaining double-digit erasures (e.g., up to 20/32 observed), provided the selected rows remain full-rank.
+Illustrative outcomes (single run): encode is faster than decode; decode scales roughly linearly with $Q$ and is insensitive to the number of lost packets along a warm mask, matching (11).
 
-### Equal data size and code rate: normalized comparison
+## VII. Conclusion
 
-Assume all schemes protect the same source size $B$ (bits) at the same code rate $Q\in(0,1)$. For RS/XOR/RLC, let $K_{\text{src}} = B / S_{\text{pkt}}$ be the number of source packets per block, so the total symbols is $M = K_{\text{src}}/Q$ and parity $R = M - K_{\text{src}} = \tfrac{1-Q}{Q}K_{\text{src}}$.
-
-- Polar+interleave (ours): choose $T = B/(Q\,N)$ codewords ($|\mathcal{I}|=Q\,N$).
-  - Encode total: $T\cdot \Theta\!\big(Q\,N^2/W\big) = \Theta\!\big( (B/(Q\,N))\cdot (Q\,N^2/W) \big) = \Theta\!\big( (N/W)\,B \big)$.
-  - Decode total: $\Theta\!\big( T\,(Q\,N)^2/W \big) = \Theta\!\big( (B/(Q\,N))\cdot (Q\,N)^2/W \big) = \Theta\!\big( (Q\,N/W)\,B \big)$, plus a one-off cold inversion $\tilde{\Theta}((Q\,N)^3/W)$ per loss mask.
-  - Both scale linearly in $B$ (constants depend on $N,W,Q$).
-- RS (typical quadratic decoders):
-  - Encode: $\Theta(K_{\text{src}}\,R) = \Theta\!\big( ((1-Q)/Q)\,K_{\text{src}}^2 \big) = \Theta\!\big( ((1-Q)/Q)\,(B/S_{\text{pkt}})^2 \big)$.
-  - Decode: $\Theta(K_{\text{src}}^{\,2}) = \Theta\!\big( (B/S_{\text{pkt}})^2 \big)$ (FFT-accelerated variants can be closer to near-linearithmic but are complex and field-dependent).
-- XOR parity:
-  - Encode: $\Theta(K_{\text{src}}\,R) = \Theta\!\big( ((1-Q)/Q)\,(B/S_{\text{pkt}}) \big)$ (linear).
-  - Decode: to recover up to $R$ erasures, $\Theta(K_{\text{src}}\,R)$ in worst case; for single-loss ($R{=}1$), $\Theta(B/S_{\text{pkt}})$.
-  - Complexity is low but erasure capability limited to $R$.
-- RLC over GF(2) or GF(256):
-  - Encode: $\Theta(K_{\text{src}}\,R)$ (GF(2) can be packed to $/W$ word ops).
-  - Decode: Gaussian elimination $\tilde{\Theta}(M^3)$ with $M\!=\!K_{\text{src}}/Q$, i.e., $\tilde{\Theta}\!\big((B/(Q\,S_{\text{pkt}}))^3\big)$; packing reduces bit-level constants but remains cubic.
-
-Conclusion (complexity): For fixed $Q$ and large $B$, our polar+interleave pipeline has linear $\Theta(B)$ complexity (with small constants for fixed $N$), versus typical RS decoders at $\Theta((B/S_{\text{pkt}})^2)$ and RLC at $\tilde{\Theta}((B/S_{\text{pkt}})^3)$. XOR parity is also linear but cannot match strong erasure budgets without large $R$ (increasing bandwidth and constants). Hence, in terms of computational complexity under equal rate and size, our method is preferable among strong erasure-correction schemes.
-
-*Note on precomputation:* The above "cold" term denotes on-demand precomputation of $\mathbf{A}^{-1}$ the first time a new loss mask is observed at a given code rate $Q$ (equivalently matrix size $Q\,N$). Precomputing $\mathbf{A}^{-1}$ for all masks is not practical (exponential in $K$), but the on-demand cache makes repeated patterns effectively amortized to the warm path.
-
-Clarification on SC decoding: we do not use an SC decoder. Both loss and no-loss cases use the packed GF(2) linear solver with cached inverses; the self-inverse transform is an equivalent alternative in the no-loss case but is not used in our fast path.
-
-### Numerical analysis (MTU 1500 B, choose $S_{\text{pkt}}{=}1024$ B)
-
-Assumptions for a concrete rule-of-thumb comparison under equal data size and code rate:
-- Packet payload cap: $S_{\text{pkt}} \le 1500$ B (typical MTU). We fix $S_{\text{pkt}} = 1024$ B $= 8192$ bits.
-- Machine word size: $W = 64$.
-- We compare total decode cost (dominant in practice) and give encode notes where helpful.
-
-Our method (polar+interleave, unified algebraic decoder) has total decode cost $\Theta\big((Q\,N/W)\,B\big)$ plus a one-off cold inversion $\tilde{\Theta}((Q\,N)^3/W)$ per loss mask. Competing schemes:
-- RS (typical quadratic decoders): $\Theta\!\big((B/S_{\text{pkt}})^2\big)$.
-- RLC (Gaussian elimination): $\tilde{\Theta}\!\big((B/(Q\,S_{\text{pkt}}))^3\big)$ over GF(2) or GF(256) (different constants, same cubic scaling).
-
-Set leading orders equal to find cross-over sizes $B_\star$ beyond which our method is asymptotically cheaper. Ignoring constant factors (focus on growth and parameters):
-
-1) Against RS decode
-$$
-\frac{Q\,N}{W}\,B \;\approx\; \Big(\frac{B}{S_{\text{pkt}}}\Big)^{\!2}
-\;\Rightarrow\; B_\star \;\approx\; \frac{Q\,N}{W}\,S_{\text{pkt}}^{\,2}.
-$$
-With $W{=}64$ and $S_{\text{pkt}}{=}8192$ bits,
-$$
-B_\star \;\approx\; (Q\,N)\,2^{20}\;\text{bits}\;=\; (Q\,N)\,2^{17}\;\text{bytes}.
-$$
-- Example $N{=}1024$: $B_\star \approx 128\,\text{MiB}\cdot Q$. For $Q{=}1/8$, $B_\star\approx 16\,\text{MiB}$.
-
-2) Against RLC decode
-$$
-\frac{Q\,N}{W}\,B \;\approx\; \Big(\frac{B}{Q\,S_{\text{pkt}}}\Big)^{\!3}
-\;\Rightarrow\; B_\star \;\approx\; Q^{2}\,\sqrt{\tfrac{N}{W}}\;S_{\text{pkt}}^{\,3/2}.
-$$
-With $W{=}64$ and $S_{\text{pkt}}{=}8192$ bits,
-$$
-B_\star \;\approx\; Q^{2}\,\sqrt{\tfrac{N}{64}}\;\underbrace{(8192)^{3/2}}_{\approx\,7.41\times10^5}\;\text{bits}
-\;=\; Q^{2}\,\sqrt{\tfrac{N}{64}}\;\underbrace{\approx\,9.27\times10^4}_{(8192)^{3/2}/8}\;\text{bytes}.
-$$
-- Example $N{=}1024$: $\sqrt{N/64}{=}4 \Rightarrow B_\star\approx 3.71\times10^5\,Q^2\,\text{bytes}$. For $Q{=}1/8$, $B_\star\approx 5.8\,\text{KiB}$.
-
-3) Amortizing the cold inversion
-$$
-	ilde{\Theta}\big((Q\,N)^3/W\big) \ll \Theta\big((Q\,N/W)\,B\big)\quad\Rightarrow\quad B \gg (Q\,N)^2\;\text{bits}.
-$$
-- Example $N{=}1024$, $Q{=}1/8$: $(Q\,N)^2{=}(128)^2{=}16384$ bits $\approx 2\,\text{KiB}$, i.e., negligible once batches exceed a few kilobytes.
-
-Summary conditions (decode-dominant):
-- For any fixed $(Q,N)$ and sufficiently large $B$, our method’s linear $\Theta(B)$ decode beats RS’s quadratic and RLC’s cubic scaling.
-- Concrete thresholds with $S_{\text{pkt}}{=}1024$ B, $W{=}64$:
-  - vs RS: our method is preferable for $\;B \gtrsim (Q\,N)\,2^{20}\;$ bits $\;\big(\approx (Q\,N)\,2^{17}\;\text{bytes}\big)$.
-  - vs RLC: our method is preferable for $\;B \gtrsim Q^{2}\,\sqrt{\tfrac{N}{64}}\,(8192)^{3/2}\;$ bits $\;\big(\approx 9.27\times10^4\,Q^{2}\,\sqrt{\tfrac{N}{64}}\;\text{bytes}\big)$.
-  - Cold inversion becomes negligible once $\;B \gg (Q\,N)^2\;$ bits.
-
-Notes:
-- XOR parity can be cheaper at very low redundancy (e.g., single-loss recovery), but it cannot meet strong erasure budgets without large $R$; compare only when requirements match.
-- Constants hidden by $\Theta(\cdot)$ vary across implementations (GF arithmetic, cache behavior). The above gives practical order-of-magnitude guidance for when our polar+interleave pipeline is CPU-favorable given the MTU constraint.
+A fused column–XOR polar encoder with packet-level interleaving realizes $\Theta(Q\,N^2/W)$ complexity independent of packet count. An algebraic erasure decoder over GF(2), with per-mask caching, yields warm-path latency linear in batch size and independent of loss count for a fixed mask. Packed operations and simple caches provide a practical, high-throughput implementation in software.
