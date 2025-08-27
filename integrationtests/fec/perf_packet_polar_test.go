@@ -18,11 +18,11 @@ func TestPacketLevelPolar_Perf(t *testing.T) {
 	dstPath := filepath.Join(root, "test_data", "decode_packet_level.txt")
 
 	// --- Editable parameters ---
-	N := 1024       // total packets per block (power of two)
-	K := 512        // source packets per block
-	L := 128        // bytes per packet
-	drops := 384    // packets dropped per block
-	epsilon := 0.38 // BEC epsilon for A selection
+	N := 32         // total packets per block (power of two)
+	K := 16         // source packets per block
+	L := 1500       // bytes per packet
+	drops := 6      // packets dropped per block
+	epsilon := 0.18 // BEC epsilon for A selection
 	// ---------------------------
 
 	if N&(N-1) != 0 {
@@ -54,6 +54,7 @@ func TestPacketLevelPolar_Perf(t *testing.T) {
 
 	out := make([]byte, 0, len(src))
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
+	// rng := mrand.New(mrand.NewSource(956)) // fixed seed for repeatability
 
 	// Process the file in blocks of K*L bytes
 	for off := 0; off < len(src); {
@@ -101,13 +102,17 @@ func TestPacketLevelPolar_Perf(t *testing.T) {
 
 		// Decode
 		tDec := time.Now()
-		decSrc, ok := fec.PacketPolarDecode(p, recv)
+		decSrc, met, ok := fec.PacketPolarDecodeSplit(p, recv)
 		d := time.Since(tDec)
 		if !ok {
 			t.Fatalf("decode failed at block %d (drops=%d)", blocks, drops)
 		}
 		decTotal += d
 		blocks++
+		// print split metrics per block occasionally (optional)
+		if blocks == 1 {
+			fmt.Printf("Split metrics (block %d): elim=%v apply=%v rank=%d swaps=%d xors=%d bytesXor=%d\n", blocks, met.ElimTime, met.ApplyTime, met.Rank, met.RowSwaps, met.RowXors, met.BytesXored)
+		}
 
 		// Append only the original bytes in this block (blockBytes)
 		// concatenate K decoded packets and slice to blockBytes

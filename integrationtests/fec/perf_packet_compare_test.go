@@ -21,7 +21,7 @@ func TestPacketLevel_Compare_RS_RLC(t *testing.T) {
 	// --- Editable parameters ---
 	K := 24
 	R := 8
-	L := 512
+	L := 1500
 	drops := 2 // per block
 	// ---------------------------
 

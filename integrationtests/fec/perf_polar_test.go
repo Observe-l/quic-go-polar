@@ -18,10 +18,10 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 	dstPath := filepath.Join(root, "test_data", "decode_FD001.txt")
 	idxPath := filepath.Join(root, "fec", "encoding_index.bin")
 	// --- Editable parameters (single place) ---
-	n := 10            // exponent: N = 2^n
+	n := 8             // exponent: N = 2^n
 	Kbatch := 32       // packets per batch
-	numDataBits := 512 // info bits per codeword
-	drop_num := 12     // packets dropped per batch
+	numDataBits := 256 // info bits per codeword
+	drop_num := 10     // packets dropped per batch
 	// ------------------------------------------
 
 	Nbits := 1 << n

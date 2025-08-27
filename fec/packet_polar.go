@@ -3,6 +3,7 @@ package fec
 import (
 	"errors"
 	"math"
+	"time"
 )
 
 // Packet-level Polar over GF(2). Systematic code with K sources and R=N-K parities.
@@ -27,7 +28,7 @@ func NewPacketPolarParams(N, K int, eps float64, maxLen int) (*PacketPolarParams
 	}
 	// check power of two
 	if N&(N-1) != 0 {
-		return nil, errors.New("N must be power of two")
+		return nil, errors.New("n must be power of two")
 	}
 	// n = log2 N
 	n := 0
@@ -150,48 +151,74 @@ type Packet struct {
 	Data  []byte
 }
 
-// Decode attempts to recover all K sources from m received packets.
-// Canonical indexing: source i has Index=i (0..K-1), parity j has Index=K+j (0..R-1).
-// Returns recovered sources in index order [0..K-1].
-func PacketPolarDecode(p *PacketPolarParams, recv []Packet) ([][]byte, bool) {
-	// Build measurement matrix rows (m x K) and attach data for in-place elimination.
+// Metrics for split-phase packet-level Polar decoding
+type PacketPolarSplitMetrics struct {
+	ElimTime     time.Duration // Phase A: matrix elimination time
+	ApplyTime    time.Duration // Phase B: replay time on payloads
+	Rank         int
+	RowSwaps     int
+	RowXors      int
+	ApplyRowXors int
+	BytesXored   int64
+}
+
+// PacketPolarDecodeSplit performs a two-phase decode:
+// Phase A: run elimination on bitset coefficient rows only, logging SWAP/XOR operations.
+// Phase B: replay the same operations on the payload buffers and extract solutions.
+func PacketPolarDecodeSplit(p *PacketPolarParams, recv []Packet) ([][]byte, PacketPolarSplitMetrics, bool) {
+	var metrics PacketPolarSplitMetrics
+	// Build separate matrices: coeff bitsets and data buffers
 	m := len(recv)
 	wordsK := (p.K + 63) / 64
-	type row struct {
-		vec  []uint64
-		data []byte
-	}
-	rows := make([]row, 0, m)
+	coeff := make([][]uint64, 0, m)
+	data := make([][]byte, 0, m)
 	for _, pkt := range recv {
 		v := make([]uint64, wordsK)
 		if pkt.Index < p.K {
-			// source row: e_i
 			i := pkt.Index
+			if i < 0 || i >= p.K {
+				continue
+			}
 			v[i>>6] |= 1 << uint(i&63)
 		} else {
 			j := pkt.Index - p.K
 			if j < 0 || j >= p.R {
-				// invalid index; skip
 				continue
 			}
-			// parity row
 			copy(v, p.Gpar[j])
 		}
-		dataCopy := make([]byte, p.MaxLen)
-		copy(dataCopy, pkt.Data)
-		rows = append(rows, row{vec: v, data: dataCopy})
+		buf := make([]byte, p.MaxLen)
+		copy(buf, pkt.Data)
+		coeff = append(coeff, v)
+		data = append(data, buf)
 	}
-	// Gaussian elimination over GF(2), track pivot rows by column
+	m = len(coeff)
+	if m < p.K {
+		return nil, metrics, false
+	}
+	// Operation log
+	type op struct {
+		kind uint8
+		i, j int
+	}
+	const (
+		opSwap uint8 = 0
+		opXor  uint8 = 1
+	)
+	// Reserve capacity ~K*m
+	oplog := make([]op, 0, p.K*min(m, p.K))
 	pivRow := make([]int, p.K)
 	for i := range pivRow {
 		pivRow[i] = -1
 	}
+	// Phase A: forward elimination on coeff only (below pivot), then back substitution (above pivot)
+	tA := time.Now()
 	r := 0
-	for c := 0; c < p.K && r < len(rows); c++ {
-		// find pivot row with bit in column c
+	for c := 0; c < p.K && r < m; c++ {
+		// find pivot row with bit c
 		pr := -1
-		for i := r; i < len(rows); i++ {
-			if ((rows[i].vec[c>>6] >> uint(c&63)) & 1) == 1 {
+		for i := r; i < m; i++ {
+			if ((coeff[i][c>>6] >> uint(c&63)) & 1) == 1 {
 				pr = i
 				break
 			}
@@ -199,37 +226,86 @@ func PacketPolarDecode(p *PacketPolarParams, recv []Packet) ([][]byte, bool) {
 		if pr == -1 {
 			continue
 		}
-		rows[r], rows[pr] = rows[pr], rows[r]
+		if pr != r {
+			coeff[r], coeff[pr] = coeff[pr], coeff[r]
+			oplog = append(oplog, op{kind: opSwap, i: r, j: pr})
+			metrics.RowSwaps++
+		}
 		pivRow[c] = r
-		// eliminate other rows in column c
-		for i := 0; i < len(rows); i++ {
-			if i == r {
-				continue
-			}
-			if ((rows[i].vec[c>>6] >> uint(c&63)) & 1) == 1 {
-				// vec xor
+		// eliminate only below pivot in forward pass
+		for i := r + 1; i < m; i++ {
+			if ((coeff[i][c>>6] >> uint(c&63)) & 1) == 1 {
 				for w := 0; w < wordsK; w++ {
-					rows[i].vec[w] ^= rows[r].vec[w]
+					coeff[i][w] ^= coeff[r][w]
 				}
-				// data xor
-				xorBytes(rows[i].data, rows[r].data)
+				oplog = append(oplog, op{kind: opXor, i: i, j: r})
+				metrics.RowXors++
 			}
 		}
 		r++
 	}
-	// check full rank
-	for c := 0; c < p.K; c++ {
-		if pivRow[c] == -1 {
-			return nil, false
+	// Back substitution: clear above each pivot
+	for c := p.K - 1; c >= 0; c-- {
+		pr := pivRow[c]
+		if pr == -1 {
+			continue
+		}
+		for i := 0; i < pr; i++ {
+			if ((coeff[i][c>>6] >> uint(c&63)) & 1) == 1 {
+				for w := 0; w < wordsK; w++ {
+					coeff[i][w] ^= coeff[pr][w]
+				}
+				oplog = append(oplog, op{kind: opXor, i: i, j: pr})
+				metrics.RowXors++
+			}
 		}
 	}
-	// Extract sources: row with pivot at column i holds source i data
+	metrics.ElimTime = time.Since(tA)
+	// rank
+	rank := 0
+	for c := 0; c < p.K; c++ {
+		if pivRow[c] != -1 {
+			rank++
+		}
+	}
+	metrics.Rank = rank
+	if rank < p.K {
+		return nil, metrics, false
+	}
+	// Phase B: replay on data only
+	tB := time.Now()
+	for _, opx := range oplog {
+		if opx.kind == opSwap {
+			data[opx.i], data[opx.j] = data[opx.j], data[opx.i]
+		} else {
+			xorBytes(data[opx.i], data[opx.j])
+			metrics.ApplyRowXors++
+			metrics.BytesXored += int64(len(data[opx.i]))
+		}
+	}
+	metrics.ApplyTime = time.Since(tB)
+	// Extract outputs by pivot rows
 	out := make([][]byte, p.K)
 	for i := 0; i < p.K; i++ {
 		out[i] = make([]byte, p.MaxLen)
-		copy(out[i], rows[pivRow[i]].data)
+		copy(out[i], data[pivRow[i]])
 	}
-	return out, true
+	return out, metrics, true
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Decode attempts to recover all K sources from m received packets.
+// Canonical indexing: source i has Index=i (0..K-1), parity j has Index=K+j (0..R-1).
+// Returns recovered sources in index order [0..K-1].
+func PacketPolarDecode(p *PacketPolarParams, recv []Packet) ([][]byte, bool) {
+	out, _, ok := PacketPolarDecodeSplit(p, recv)
+	return out, ok
 }
 
 // Utilities
