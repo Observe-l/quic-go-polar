@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -18,7 +17,15 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 	srcPath := filepath.Join(root, "test_data", "train_FD001.txt")
 	dstPath := filepath.Join(root, "test_data", "decode_FD001.txt")
 	idxPath := filepath.Join(root, "fec", "encoding_index.bin")
-	mapPath := filepath.Join(root, "fec", "random_map_1024.bin")
+	// --- Editable parameters (single place) ---
+	n := 7            // exponent: N = 2^n
+	Kbatch := 32      // packets per batch
+	numDataBits := 64 // info bits per codeword
+	drop_num := 4     // packets dropped per batch
+	// ------------------------------------------
+
+	Nbits := 1 << n
+	mapPath := filepath.Join(root, "fec", fmt.Sprintf("random_map_%d.bin", Nbits))
 	// Packet LUT persisted file (tied to n=10, kinfo, K; internal CRC binds to map contents)
 
 	// Reset decode metrics for a clean run
@@ -37,38 +44,26 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 		t.Fatalf("load encoding index: %v", err)
 	}
 
-	const Kbatch = 32 // packets per batch (must be power of 2)
-	// Allow overriding info-bits via env; must be multiple of 8 and <= len(encodingIndex)
-	numDataBits := 800
-	if s := os.Getenv("POLAR_NUM_DATABITS"); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 && v%8 == 0 && v <= len(encodingIndex) {
-			numDataBits = v
-		}
-	}
+	// Print active parameters before encoding
+	t.Logf("Params: n=%d, N=%d, Kbatch=%d, drops=%d, numDataBits=%d", n, Nbits, Kbatch, drop_num, numDataBits)
+	fmt.Printf("Params: n=%d, N=%d, Kbatch=%d, drops=%d, numDataBits=%d\n", n, Nbits, Kbatch, drop_num, numDataBits)
 	constBytes := numDataBits / 8
 	msgSize := constBytes
-	// Keep packet size at 1024 bytes regardless of numDataBits: 8 codewords per packet subset
-	const numMsgsPerBatch = 8 * Kbatch
-	subsetSizeBits := 1024 / Kbatch
-	// Base drop count for low-loss vs high-loss comparison; adapt to keep system solvable at high Q.
-	requestedDrop := 2
-	maxDrop := (1024-numDataBits)/subsetSizeBits - 1
-	if maxDrop < 0 {
-		maxDrop = 0
-	}
-	drop_num := requestedDrop
-	if drop_num > maxDrop {
-		drop_num = maxDrop
-	}
+	// Packet size equals Nbits/8 regardless of numDataBits; we keep 8 codewords per subset
+	constMsgsPerSubset := 8
+	numMsgsPerBatch := constMsgsPerSubset * Kbatch
+	// droppackets per batch: already set in parameters above
 
 	encTotal := time.Duration(0)
 	decTotal := time.Duration(0)
 
 	out := make([]byte, 0, len(src))
 	// Try to load a persisted random map; if missing, we'll save after first encode
-	var persistedMap []int
-	if rm, err := fec.LoadRandomMap(mapPath, 1024); err == nil {
-		persistedMap = rm
+	// Require a pre-generated random map for this N to ensure stable, comparable perf.
+	// Generate with: go run ./fec/tools/gen_random_map -n <N>
+	persistedMap, err := fec.LoadRandomMap(mapPath, Nbits)
+	if err != nil {
+		t.Fatalf("missing random map for N=%d at %s: %v. Generate with: go run ./fec/tools/gen_random_map -n %d", Nbits, mapPath, err, Nbits)
 	}
 	// Use a different loss mask per batch to simulate real data transfer with varying losses.
 	rgen := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -97,46 +92,29 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 		// predeclare batch-scoped vars
 		var packets [][]byte
 		var randomMap []int
-		// The first successful decode path will account for decoding time; we still track encode time per batch.
+		// Track encode time per batch.
 		encStart := time.Now()
-		encEnd := encStart // will set after encode succeeds in retry loop
+		encEnd := encStart
 
-		// Simulate loss with retries to avoid rare rank-deficiency at very high Q
-		var recMsgs [][]byte
-		losses := drop_num
-		for attempt := 0; attempt < 4; attempt++ {
-			// reset packets for this attempt
-			// Re-encode for a clean slate
-			// Note: reusing previously built 'msgs' and same randomMap for determinism on encode
-			packets, randomMap, err = fec.EncodeMsgsAndBitInterleave(msgs, encodingIndex, persistedMap, Kbatch)
-			if err != nil {
-				t.Fatalf("encode(retry): %v", err)
-			}
-			// Record encode end after first successful encode
-			if attempt == 0 {
-				encEnd = time.Now()
-			}
-			perm := rgen.Perm(Kbatch)
-			for i := 0; i < losses; i++ {
-				packets[perm[i]] = nil
-			}
-			t1 := time.Now()
-			recMsgs, err = fec.DecodeMsgs(packets, randomMap, encodingIndex, numDataBits)
-			d := time.Since(t1)
-			if err == nil {
-				decTotal += d
-				break
-			}
-			if attempt == 3 && losses > 0 {
-				// last resort: reduce losses by one and try once more
-				attempt = -1
-				losses--
-				continue
-			}
-		}
+		// Encode once
+		packets, randomMap, err = fec.EncodeMsgsAndBitInterleaveN(msgs, encodingIndex, persistedMap, Kbatch, n)
 		if err != nil {
-			t.Fatalf("decode failed after retries: %v", err)
+			t.Fatalf("encode: %v", err)
 		}
+		encEnd = time.Now()
+		// Apply losses exactly as specified
+		perm := rgen.Perm(Kbatch)
+		for i := 0; i < drop_num && i < len(perm); i++ {
+			packets[perm[i]] = nil
+		}
+		// Decode once (may fail as expected)
+		t1 := time.Now()
+		recMsgs, err := fec.DecodeMsgsN(packets, randomMap, encodingIndex, numDataBits, n)
+		d := time.Since(t1)
+		if err != nil {
+			t.Fatalf("decode failed: %v", err)
+		}
+		decTotal += d
 		encTotal += encEnd.Sub(encStart)
 
 		// Append only the messages actually filled from the source
@@ -159,7 +137,7 @@ func TestPolarPerformance_EncodeDecodeFile(t *testing.T) {
 	stats := fec.GetPolarDecodeStats()
 	p := fec.GetPolarPerfBreakdown()
 	t.Logf("Polar encode time (total): %v", encTotal)
-	t.Logf("Polar decode time (total) [%d drops of 32, %d bits]: %v", drop_num, numDataBits, decTotal)
+	t.Logf("Polar decode time (total) [%d drops of %d, %d bits]: %v", drop_num, Kbatch, numDataBits, decTotal)
 	t.Logf("Total time: %v", total)
 	t.Logf("Polar warm decode: total=%v, codewords=%d, avg warm per CW=%v", stats.WarmTotal, stats.WarmCodewords, stats.AvgWarmPerCW)
 	t.Logf("Polar cold decode: total=%v, codewords=%d, avg cold per CW=%v", stats.ColdTotal, stats.ColdCodewords, stats.AvgColdPerCW)

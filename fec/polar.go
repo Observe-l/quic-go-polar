@@ -181,11 +181,26 @@ func getInfoColsAndG(n int, encodingIndex []int, numDataBits int) ([][]bool, []i
 	if cachedGcols != nil && cachedPolarN == n && len(cachedInfoCols) == numDataBits {
 		return cachedGcols, cachedInfoCols
 	}
-	infoCols := make([]int, numDataBits)
-	for i := 0; i < numDataBits; i++ {
-		infoCols[i] = bitReverseN(encodingIndex[i], n)
-	}
+	// Build infoCols by taking entries from encodingIndex that fall within [0, N).
+	// This allows using a universal reliability sequence file for different N.
 	N := 1 << n
+	infoCols := make([]int, 0, numDataBits)
+	for _, idx := range encodingIndex {
+		if idx < N {
+			infoCols = append(infoCols, bitReverseN(idx, n))
+			if len(infoCols) == numDataBits {
+				break
+			}
+		}
+	}
+	if len(infoCols) != numDataBits {
+		// Not enough indices < N to satisfy request.
+		// Fall back to original behavior (unsafe) to avoid panic, but this likely indicates a bad config.
+		infoCols = make([]int, numDataBits)
+		for i := 0; i < numDataBits; i++ {
+			infoCols[i] = bitReverseN(encodingIndex[i], n)
+		}
+	}
 	Gcols := make([][]bool, numDataBits)
 	for c := 0; c < numDataBits; c++ {
 		j := infoCols[c]
@@ -229,7 +244,8 @@ func getPackedInfoCols(n int, encodingIndex []int, numDataBits int) ([][]uint64,
 // getStableRandomMap returns a deterministic random permutation of [0..codewordBits-1]
 // using a fixed seed, cached by K to align subset partitioning.
 func getStableRandomMap(codewordBits, K int) []int {
-	if cachedRandMap != nil && cachedRandMapK == K {
+	// Also bind to codewordBits length; different N must rebuild.
+	if cachedRandMap != nil && cachedRandMapK == K && len(cachedRandMap) == codewordBits {
 		return cachedRandMap
 	}
 	r := rand.New(rand.NewSource(1)) // fixed seed for stability
@@ -260,7 +276,7 @@ func buildInterleavePlan(randomMap []int, K int) [][][8]struct {
 			return cachedPlan
 		}
 	}
-	const codewordBits = 1024
+	codewordBits := len(randomMap)
 	subsetSizeBits := codewordBits / K
 	subsetBytes := subsetSizeBits / 8
 	plan := make([][][8]struct {
@@ -310,10 +326,7 @@ func getPacketLUT(n int, encodingIndex []int, numDataBits int, randomMap []int, 
 			return cachedPacketLUT, nil
 		}
 	}
-	const codewordBits = 1 << 10 // N=1024 for n=10
-	if n != 10 {
-		return nil, errors.New("only n=10 supported here")
-	}
+	codewordBits := 1 << n
 	if numDataBits%8 != 0 {
 		return nil, errors.New("numDataBits must be multiple of 8")
 	}
@@ -773,18 +786,25 @@ func LoadEncodingIndex(filePath string) ([]int, error) {
 func EncodePolarGN(data []byte, n int, encodingIndex []int) ([]byte, error) {
 	dataBits := len(data) * 8
 	N := 1 << n
-	if len(encodingIndex) < dataBits {
-		return nil, errors.New("encoding index length error")
+	// Build the information positions using only indices within [0, N).
+	infoPos := make([]int, 0, dataBits)
+	for _, idx := range encodingIndex {
+		if idx < N {
+			infoPos = append(infoPos, bitReverseN(idx, n))
+			if len(infoPos) == dataBits {
+				break
+			}
+		}
+	}
+	if len(infoPos) != dataBits {
+		return nil, errors.New("not enough reliability indices for this N and data size")
 	}
 	// Create the information vector 'u' using the reliability sequence.
 	u := make([]bool, N)
 	bitCounter := 0
 	for _, byteVal := range data {
-		for j := range 8 {
-			// Our encoder applies only F^{⊗n} (no bit-reversal permutation B_N).
-			// Many reliability sequences are given in the B_N*F^{⊗n} domain.
-			// Align by bit-reversing the index into our u-domain.
-			destIndex := bitReverseN(encodingIndex[bitCounter], n)
+		for j := 0; j < 8; j++ {
+			destIndex := infoPos[bitCounter]
 			bitValue := (byteVal>>j)&1 == 1
 			u[destIndex] = bitValue
 			bitCounter++
@@ -894,11 +914,20 @@ func EncodeAndBitInterleaveFrames(dataFrames [][]byte, encodingIndex []int) (fin
 // EncodeMsgsAndBitInterleave encodes arbitrary-size messages (len in bytes, multiple of 1 byte) into 1024-bit codewords
 // and interleaves bits across K packets according to randomMap. If randomMap is nil, a stable one is generated.
 func EncodeMsgsAndBitInterleave(msgs [][]byte, encodingIndex []int, randomMap []int, K int) ([][]byte, []int, error) {
+	return EncodeMsgsAndBitInterleaveN(msgs, encodingIndex, randomMap, K, 10)
+}
+
+// EncodeMsgsAndBitInterleaveN encodes arbitrary-size messages into N=2^n bit codewords
+// and interleaves bits across K packets according to randomMap. If randomMap is nil, a stable one is generated.
+func EncodeMsgsAndBitInterleaveN(msgs [][]byte, encodingIndex []int, randomMap []int, K int, n int) ([][]byte, []int, error) {
 	if K == 0 || (K&(K-1)) != 0 {
 		return nil, nil, errors.New("k must be power of 2")
 	}
-	const polarN = 10
-	const codewordBits = 1 << polarN
+	const minN = 1
+	if n < minN {
+		return nil, nil, errors.New("invalid n")
+	}
+	codewordBits := 1 << n
 	numCodewords := len(msgs)
 	codewords := make([][]byte, numCodewords)
 	// Fast path: if all messages have same length, precompute packed columns and XOR
@@ -928,7 +957,7 @@ func EncodeMsgsAndBitInterleave(msgs [][]byte, encodingIndex []int, randomMap []
 		for i := 0; i < K; i++ {
 			packets[i] = make([]byte, outBytes)
 		}
-		pktLUT, err := getPacketLUT(polarN, encodingIndex, msgBits, randomMap, K)
+		pktLUT, err := getPacketLUT(n, encodingIndex, msgBits, randomMap, K)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -958,7 +987,7 @@ func EncodeMsgsAndBitInterleave(msgs [][]byte, encodingIndex []int, randomMap []
 			if (len(m) * 8) > len(encodingIndex) {
 				return nil, nil, errors.New("encodingIndex too short for msg")
 			}
-			cw, err := EncodePolarGN(m, polarN, encodingIndex)
+			cw, err := EncodePolarGN(m, n, encodingIndex)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1024,7 +1053,7 @@ func DeinterleaveKnownGeneric(interleavedPackets [][]byte, randomMap []int) ([][
 	if K == 0 {
 		return nil, errors.New("no packets")
 	}
-	const codewordBits = 1024
+	codewordBits := len(randomMap)
 	subsetSizeBits := codewordBits / K
 	// infer numCodewords from packet size
 	var pktLen int
@@ -1088,11 +1117,15 @@ func DeinterleaveKnownGeneric(interleavedPackets [][]byte, randomMap []int) ([][
 
 // DecodeMsgs decodes variable-size messages (numDataBits) from interleaved packets using algebraic erasure decoding.
 func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, numDataBits int) ([][]byte, error) {
+	return DecodeMsgsN(interleavedPackets, randomMap, encodingIndex, numDataBits, 10)
+}
+
+// DecodeMsgsN decodes variable-size messages from interleaved packets using algebraic erasure decoding for N=2^n.
+func DecodeMsgsN(interleavedPackets [][]byte, randomMap, encodingIndex []int, numDataBits int, n int) ([][]byte, error) {
 	totalStart := time.Now()
 	K := len(interleavedPackets)
-	const polarN = 10
 	// We route both loss and no-loss cases through the packed algebraic path for speed and consistency.
-	N := 1 << polarN
+	N := 1 << n
 	// Build presence and known rows using inverse map
 	subsetSizeBits := N / K
 	var mask uint32
@@ -1297,7 +1330,7 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		return out, nil
 	}
 	// Row selection: try a fast greedy assignment using (r & j)==j; fall back to packed-basis selection.
-	Gcols, infoCols := getInfoColsAndG(polarN, encodingIndex, numDataBits)
+	Gcols, infoCols := getInfoColsAndG(n, encodingIndex, numDataBits)
 	// Compute known row indices once
 	presentRow := make([]bool, N)
 	for i := 0; i < N; i++ {
@@ -1350,7 +1383,7 @@ func DecodeMsgs(interleavedPackets [][]byte, randomMap, encodingIndex []int, num
 		}
 	} else {
 		// Fallback: basis selection via packed columns
-		packedCols, _ := getPackedInfoCols(polarN, encodingIndex, numDataBits)
+		packedCols, _ := getPackedInfoCols(n, encodingIndex, numDataBits)
 		wordsK := (numDataBits + 63) / 64
 		basisRows := make([][]uint64, 0, numDataBits)
 		basisPivot := make([]int, 0, numDataBits)
