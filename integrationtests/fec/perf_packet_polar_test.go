@@ -18,11 +18,11 @@ func TestPacketLevelPolar_Perf(t *testing.T) {
 	dstPath := filepath.Join(root, "test_data", "decode_packet_level.txt")
 
 	// --- Editable parameters ---
-	N := 32         // total packets per block (power of two)
-	K := 16         // source packets per block
-	L := 1500       // bytes per packet
-	drops := 4      // packets dropped per block
-	epsilon := 0.13 // BEC epsilon for A selection
+	N := 1024       // total packets per block (power of two)
+	K := 512        // source packets per block
+	L := 128        // bytes per packet
+	drops := 384    // packets dropped per block
+	epsilon := 0.38 // BEC epsilon for A selection
 	// ---------------------------
 
 	if N&(N-1) != 0 {

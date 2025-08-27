@@ -1,48 +1,90 @@
 package fec
 
-// GF(256) arithmetic with AES polynomial 0x11b.
+// Simple GF(256) arithmetic using log/antilog tables with primitive polynomial 0x11d.
 
-var expTable [512]byte
-var logTable [256]byte
+var (
+	gfExp    [512]byte
+	gfLog    [256]byte
+	gfInited bool
+	// compatibility tables for existing code
+	expTable [512]byte
+	logTable [256]byte
+)
 
-func init() {
-	// Build exp and log tables using a primitive generator g=0x03 under AES polynomial 0x11b.
-	// This ensures all 255 non-zero elements are covered.
-	exp := byte(1)
+func gf256Init() {
+	if gfInited {
+		return
+	}
+	// generator = 0x02, primitive polynomial = 0x11d
+	x := 1
 	for i := 0; i < 255; i++ {
-		expTable[i] = exp
-		logTable[exp] = byte(i)
-		// multiply by 3: (x*2) ^ x under GF(2)
-		exp = xtime(exp) ^ exp
+		gfExp[i] = byte(x)
+		gfLog[byte(x)] = byte(i)
+		x <<= 1
+		if (x & 0x100) != 0 { // carry out from bit 8
+			x ^= 0x11d // reduce by 0x11d
+		}
 	}
 	for i := 255; i < 512; i++ {
-		expTable[i] = expTable[i-255]
+		gfExp[i] = gfExp[i-255]
 	}
+	gfInited = true
+	// fill legacy tables
+	copy(expTable[:], gfExp[:])
+	copy(logTable[:], gfLog[:])
 }
 
-func xtime(x byte) byte {
-	if x&0x80 != 0 {
-		return (x << 1) ^ 0x1b
-	}
-	return x << 1
-}
-
-func gf256Mul(a, b byte) byte {
+func gfMul(a, b byte) byte {
 	if a == 0 || b == 0 {
 		return 0
 	}
-	la := logTable[a]
-	lb := logTable[b]
-	return expTable[int(la)+int(lb)]
+	if !gfInited {
+		gf256Init()
+	}
+	return gfExp[int(gfLog[a])+int(gfLog[b])]
 }
 
-func gf256Inv(a byte) byte {
+func gfInv(a byte) byte {
 	if a == 0 {
 		return 0
 	}
-	return expTable[255-int(logTable[a])]
+	if !gfInited {
+		gf256Init()
+	}
+	return gfExp[255-int(gfLog[a])]
 }
 
-// Test helpers (exported) to access tables in tests without reimplementing
-func GF256Exp(i int) byte  { return expTable[i%255] }
-func GF256Log(a byte) byte { return logTable[a] }
+// no gfAdd/gfDiv needed; use XOR and gfMul+gfInv as required
+
+// alphaPow returns generator^e, with e mod 255.
+func alphaPow(e int) byte {
+	if !gfInited {
+		gf256Init()
+	}
+	e %= 255
+	if e < 0 {
+		e += 255
+	}
+	if e == 0 {
+		return 1
+	}
+	return gfExp[e]
+}
+
+// gfMulBytes multiplies src by scalar a and xors into dst: dst ^= a*src
+func gfMulBytes(dst, src []byte, a byte) {
+	if a == 0 {
+		return
+	}
+	if a == 1 {
+		xorBytes(dst, src)
+		return
+	}
+	for i := 0; i < len(dst) && i < len(src); i++ {
+		dst[i] ^= gfMul(a, src[i])
+	}
+}
+
+// Legacy wrappers
+func gf256Mul(a, b byte) byte { return gfMul(a, b) }
+func gf256Inv(a byte) byte    { return gfInv(a) }
