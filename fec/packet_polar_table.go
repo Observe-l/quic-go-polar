@@ -156,7 +156,7 @@ func NewPacketPolarParamsFromTable(tbl *PacketPolarOfflineTable, reqEps float64,
 	rowsHex, crc, sha := serializeGparRows(gpar, tbl.WordsPerRow)
 	_ = rowsHex // not used; just recomputed
 	if crc != e.CRC32 || sha != e.SHA256 {
-		return nil, errors.New("Gpar checksum mismatch in table")
+		return nil, errors.New("gpar checksum mismatch in table")
 	}
 	p := &PacketPolarParams{
 		N: tbl.N, K: tbl.K, Epsilon: e.Epsilon, MaxLen: maxLen,

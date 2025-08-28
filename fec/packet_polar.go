@@ -35,7 +35,6 @@ func NewPacketPolarParams(N, K int, eps float64, maxLen int) (*PacketPolarParams
 	for (1 << n) < N {
 		n++
 	}
-	R := N - K
 	// 1) Choose info set A via BEC Bhattacharyya recursion
 	z := bhattacharyyaBEC(N, eps)
 	idx := make([]int, N)
@@ -62,68 +61,7 @@ func NewPacketPolarParams(N, K int, eps float64, maxLen int) (*PacketPolarParams
 			}
 		}
 	}
-	// Build Ac as the complement, ascending
-	inA := make([]bool, N)
-	for _, v := range A {
-		inA[v] = true
-	}
-	Ac := make([]int, 0, R)
-	for i := 0; i < N; i++ {
-		if !inA[i] {
-			Ac = append(Ac, i)
-		}
-	}
-	// 2) Build G_N (N x N)
-	G := polarGeneratorBool(n)
-	// 3) Extract G_AA (KxK) and G_AAc (KxR)
-	GAA := make([][]bool, K)
-	GAAc := make([][]bool, K)
-	for i := 0; i < K; i++ {
-		row := make([]bool, K)
-		for j := 0; j < K; j++ {
-			row[j] = G[A[i]][A[j]]
-		}
-		GAA[i] = row
-		row2 := make([]bool, R)
-		for j := 0; j < R; j++ {
-			row2[j] = G[A[i]][Ac[j]]
-		}
-		GAAc[i] = row2
-	}
-	// 4) inv(G_AA)
-	invGAA, ok := invertBoolMatrixGF2(GAA)
-	if !ok {
-		return nil, errors.New("G_AA not invertible")
-	}
-	// 5) P = inv(G_AA) * G_AAc  => (KxK)*(KxR) = KxR
-	P := make([][]bool, K)
-	for i := 0; i < K; i++ {
-		row := make([]bool, R)
-		for j := 0; j < R; j++ {
-			s := false
-			for t := 0; t < K; t++ {
-				if invGAA[i][t] && GAAc[t][j] {
-					s = !s
-				}
-			}
-			row[j] = s
-		}
-		P[i] = row
-	}
-	// 6) Build Gpar rows (R rows), row j is column j of P (size K)
-	wordsK := (K + 63) / 64
-	Gpar := make([][]uint64, R)
-	for j := 0; j < R; j++ {
-		row := make([]uint64, wordsK)
-		for i := 0; i < K; i++ {
-			if P[i][j] {
-				row[i>>6] |= 1 << uint(i&63)
-			}
-		}
-		Gpar[j] = row
-	}
-
-	return &PacketPolarParams{N: N, K: K, Epsilon: eps, MaxLen: maxLen, n: n, R: R, A: A, Ac: Ac, Gpar: Gpar}, nil
+	return NewPacketPolarParamsFromA(N, K, A, maxLen)
 }
 
 // Encode produces R parity packets (with indices K..N-1 in the canonical order).
@@ -347,4 +285,94 @@ func bhattacharyyaBEC(N int, eps float64) []float64 {
 		levels = append(levels, next)
 	}
 	return levels[len(levels)-1]
+}
+
+// NewPacketPolarParamsFromA builds params given an explicit information set A (ascending, |A|=K).
+// It computes Ac, constructs G_N, forms P = inv(G_AA)*G_AAc, and builds bitset rows Gpar.
+func NewPacketPolarParamsFromA(N, K int, A []int, maxLen int) (*PacketPolarParams, error) {
+	if N <= 0 || K <= 0 || K >= N {
+		return nil, errors.New("invalid N,K")
+	}
+	if N&(N-1) != 0 {
+		return nil, errors.New("n must be power of two")
+	}
+	if len(A) != K {
+		return nil, errors.New("len(A) != K")
+	}
+	// verify A in range and ascending
+	for i := 0; i < K; i++ {
+		if A[i] < 0 || A[i] >= N {
+			return nil, errors.New("a out of range")
+		}
+		if i > 0 && A[i] < A[i-1] {
+			return nil, errors.New("a must be ascending")
+		}
+	}
+	// n = log2 N
+	n := 0
+	for (1 << n) < N {
+		n++
+	}
+	R := N - K
+	// Build Ac as the complement, ascending
+	inA := make([]bool, N)
+	for _, v := range A {
+		inA[v] = true
+	}
+	Ac := make([]int, 0, R)
+	for i := 0; i < N; i++ {
+		if !inA[i] {
+			Ac = append(Ac, i)
+		}
+	}
+	// Build G_N (N x N)
+	G := polarGeneratorBool(n)
+	// Extract G_AA (KxK) and G_AAc (KxR)
+	GAA := make([][]bool, K)
+	GAAc := make([][]bool, K)
+	for i := 0; i < K; i++ {
+		row := make([]bool, K)
+		for j := 0; j < K; j++ {
+			row[j] = G[A[i]][A[j]]
+		}
+		GAA[i] = row
+		row2 := make([]bool, R)
+		for j := 0; j < R; j++ {
+			row2[j] = G[A[i]][Ac[j]]
+		}
+		GAAc[i] = row2
+	}
+	// inv(G_AA)
+	invGAA, ok := invertBoolMatrixGF2(GAA)
+	if !ok {
+		return nil, errors.New("G_AA not invertible")
+	}
+	// P = inv(G_AA) * G_AAc  => (KxK)*(KxR) = KxR
+	P := make([][]bool, K)
+	for i := 0; i < K; i++ {
+		row := make([]bool, R)
+		for j := 0; j < R; j++ {
+			s := false
+			for t := 0; t < K; t++ {
+				if invGAA[i][t] && GAAc[t][j] {
+					s = !s
+				}
+			}
+			row[j] = s
+		}
+		P[i] = row
+	}
+	// Build Gpar rows (R rows), row j is column j of P (size K)
+	wordsK := (K + 63) / 64
+	Gpar := make([][]uint64, R)
+	for j := 0; j < R; j++ {
+		row := make([]uint64, wordsK)
+		for i := 0; i < K; i++ {
+			if P[i][j] {
+				row[i>>6] |= 1 << uint(i&63)
+			}
+		}
+		Gpar[j] = row
+	}
+	return &PacketPolarParams{N: N, K: K, Epsilon: 0, MaxLen: maxLen, n: n, R: R, A: append([]int(nil), A...), Ac: Ac, Gpar: Gpar}, nil
 }

@@ -20,7 +20,7 @@ func NewPacketPolarParamsFromArtifacts(baseDir string, N, K, e, maxLen int) (*Pa
 		return nil, errors.New("invalid N,K")
 	}
 	if N&(N-1) != 0 {
-		return nil, errors.New("N must be power of two")
+		return nil, errors.New("n must be power of two")
 	}
 	cfgDir := filepath.Join(baseDir, fmt.Sprintf("N%[1]d_K%[2]d_e%[3]d", N, K, e))
 	entries, err := os.ReadDir(cfgDir)
@@ -62,13 +62,13 @@ func NewPacketPolarParamsFromArtifacts(baseDir string, N, K, e, maxLen int) (*Pa
 		return nil, fmt.Errorf("read A.json: %w", err)
 	}
 	if len(A) != K {
-		return nil, fmt.Errorf("A.json length mismatch: expected K=%d got %d", K, len(A))
+		return nil, fmt.Errorf("a.json length mismatch: expected K=%d got %d", K, len(A))
 	}
 	// Build Ac (complement ascending)
 	inA := make([]bool, N)
 	for _, v := range A {
 		if v < 0 || v >= N {
-			return nil, fmt.Errorf("A index out of range: %d", v)
+			return nil, fmt.Errorf("a index out of range: %d", v)
 		}
 		inA[v] = true
 	}
