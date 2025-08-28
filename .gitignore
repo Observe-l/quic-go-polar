@@ -19,3 +19,6 @@ gomock_reflect_*/
 
 results/
 test_data/
+tables/
+bin/
+cmd/
