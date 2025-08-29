@@ -12,6 +12,25 @@ import (
 	"github.com/quic-go/quic-go/fec"
 )
 
+// repoRoot finds the repository root by searching for go.mod upwards.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	wd, _ := os.Getwd()
+	dir := wd
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		nd := filepath.Dir(dir)
+		if nd == dir || nd == "/" {
+			break
+		}
+		dir = nd
+	}
+	// fallback to working directory
+	return wd
+}
+
 func TestPacketLevel_Compare_RS_RLC(t *testing.T) {
 	root := repoRoot(t)
 	srcPath := filepath.Join(root, "test_data", "train_FD001.txt")

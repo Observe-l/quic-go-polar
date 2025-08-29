@@ -376,3 +376,10 @@ func NewPacketPolarParamsFromA(N, K int, A []int, maxLen int) (*PacketPolarParam
 	}
 	return &PacketPolarParams{N: N, K: K, Epsilon: 0, MaxLen: maxLen, n: n, R: R, A: append([]int(nil), A...), Ac: Ac, Gpar: Gpar}, nil
 }
+
+// byte-wise XOR helper used by multiple schemes
+func xorBytes(dst, src []byte) {
+	for i := range dst {
+		dst[i] ^= src[i]
+	}
+}

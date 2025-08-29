@@ -88,3 +88,53 @@ func gfMulBytes(dst, src []byte, a byte) {
 // Legacy wrappers
 func gf256Mul(a, b byte) byte { return gfMul(a, b) }
 func gf256Inv(a byte) byte    { return gfInv(a) }
+
+func gf256InvertMatrix(A [][]byte) ([][]byte, bool) {
+	n := len(A)
+	aug := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		aug[i] = make([]byte, n*2)
+		copy(aug[i][:n], A[i])
+		aug[i][n+i] = 1
+	}
+	row := 0
+	for col := 0; col < n && row < n; col++ {
+		pivot := -1
+		for r := row; r < n; r++ {
+			if aug[r][col] != 0 {
+				pivot = r
+				break
+			}
+		}
+		if pivot == -1 {
+			continue
+		}
+		aug[row], aug[pivot] = aug[pivot], aug[row]
+		inv := gf256Inv(aug[row][col])
+		for j := 0; j < 2*n; j++ {
+			aug[row][j] = gf256Mul(aug[row][j], inv)
+		}
+		for r := 0; r < n; r++ {
+			if r == row {
+				continue
+			}
+			factor := aug[r][col]
+			if factor == 0 {
+				continue
+			}
+			for j := 0; j < 2*n; j++ {
+				aug[r][j] ^= gf256Mul(aug[row][j], factor)
+			}
+		}
+		row++
+	}
+	if row < n {
+		return nil, false
+	}
+	invA := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		invA[i] = make([]byte, n)
+		copy(invA[i], aug[i][n:])
+	}
+	return invA, true
+}
