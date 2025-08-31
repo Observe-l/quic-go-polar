@@ -6,14 +6,15 @@ import (
 
 // FECScheme identifiers used on the wire.
 const (
-	SchemeRLC   uint8 = 0
-	SchemeRS    uint8 = 1
-	SchemePolar uint8 = 2
+	SchemeRLC     uint8 = 0
+	SchemeRS      uint8 = 1
+	SchemePolar   uint8 = 2
+	SchemeRaptorQ uint8 = 3
 )
 
 type FECHeader struct {
 	Version    uint8  // 1
-	Scheme     uint8  // 0=RLC,1=RS,2=Polar
+	Scheme     uint8  // 0=RLC,1=RS,2=Polar,3=RaptorQ
 	BlockID    uint16 // per-block counter
 	N          uint8
 	K          uint8
