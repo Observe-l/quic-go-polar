@@ -16,12 +16,13 @@ func TestPacketLevelPolar_Perf(t *testing.T) {
 	root := repoRoot(t)
 	srcPath := filepath.Join(root, "test_data", "train_FD001.txt")
 	dstPath := filepath.Join(root, "test_data", "decode_packet_level.txt")
+	table := filepath.Join(root, "docs", "polar_table_5_3_1_2_1_inverted.txt")
 
 	// --- Editable parameters ---
-	N := 32         // total packets per block (power of two)
-	K := 16         // source packets per block
-	L := 1500       // bytes per packet
-	drops := 6      // packets dropped per block
+	N := 1024       // total packets per block (power of two)
+	K := 512        // source packets per block
+	L := 512        // bytes per packet
+	drops := 100    // packets dropped per block
 	epsilon := 0.18 // BEC epsilon for A selection
 	e := drops      // preferred artifacts are keyed by e (=drops)
 	// ---------------------------
@@ -45,14 +46,23 @@ func TestPacketLevelPolar_Perf(t *testing.T) {
 
 	// Build params: prefer per-(N,K,e) artifacts under tables/, then fallback to epsilon table, else runtime
 	var p *fec.PacketPolarParams
+	// try 3pg first
+	if _, err := os.Stat(table); err == nil {
+		if pp, err := fec.NewPacketPolarParamsFrom3GPP(table, N, K, L); err == nil {
+			p = pp
+		}
+	}
+
 	// try artifacts first
 	artBase := filepath.Join(root, "tables")
-	if _, err := os.Stat(filepath.Join(artBase, fmt.Sprintf("N%d_K%d_e%d", N, K, e))); err == nil {
-		if pp, err := fec.NewPacketPolarParamsFromArtifacts(artBase, N, K, e, L); err == nil {
-			p = pp
-			t.Logf("loaded artifacts from %s", artBase)
-		} else {
-			t.Logf("warn: artifacts load failed: %v", err)
+	if p == nil {
+		if _, err := os.Stat(filepath.Join(artBase, fmt.Sprintf("N%d_K%d_e%d", N, K, e))); err == nil {
+			if pp, err := fec.NewPacketPolarParamsFromArtifacts(artBase, N, K, e, L); err == nil {
+				p = pp
+				t.Logf("loaded artifacts from %s", artBase)
+			} else {
+				t.Logf("warn: artifacts load failed: %v", err)
+			}
 		}
 	}
 	if p == nil {

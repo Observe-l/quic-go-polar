@@ -383,3 +383,199 @@ func xorBytes(dst, src []byte) {
 		dst[i] ^= src[i]
 	}
 }
+
+// --- Reusable factorization and solver for caching across repeated masks ---
+
+// PacketPolarFact captures the elimination log and pivot rows for a given present set.
+type PacketPolarFact struct {
+	// Operation log to transform data rows: swap(i,j) or xor(i,j)
+	Oplog []struct {
+		Kind uint8
+		I, J int
+	}
+	// Pivot row per column in [0..K-1]; -1 if no pivot (rank deficiency)
+	PivRow []int
+	// Rank achieved during elimination
+	Rank int
+	// Row positions in codeword order for each row in the factorization (len==m)
+	RowPos []int
+	// Present indices in canonical indexing (0..K-1 sources, K..N-1 parity)
+	Present []int
+}
+
+// PacketPolarFactorize builds the coefficient matrix from the present indices and performs
+// elimination over GF(2), returning the reusable factorization and metrics.
+// The row order is exactly the order of the provided present indices.
+func PacketPolarFactorize(p *PacketPolarParams, present []int) (PacketPolarFact, PacketPolarSplitMetrics, bool) {
+	var metrics PacketPolarSplitMetrics
+	fact := PacketPolarFact{}
+	m := len(present)
+	if m < p.K {
+		return fact, metrics, false
+	}
+	wordsK := (p.K + 63) / 64
+	coeff := make([][]uint64, m)
+	rowPos := make([]int, m)
+	for r := 0; r < m; r++ {
+		v := make([]uint64, wordsK)
+		idx := present[r]
+		if idx < p.K {
+			// source row: identity e_idx
+			v[idx>>6] |= 1 << uint(idx&63)
+			rowPos[r] = p.A[idx]
+		} else {
+			j := idx - p.K
+			if j < 0 || j >= p.R {
+				continue
+			}
+			copy(v, p.Gpar[j])
+			rowPos[r] = p.Ac[j]
+		}
+		coeff[r] = v
+	}
+	// Elimination identical to PacketPolarDecodeSplit, recording operations.
+	type op struct {
+		kind uint8
+		i, j int
+	}
+	const (
+		opSwap uint8 = 0
+		opXor  uint8 = 1
+	)
+	oplog := make([]op, 0, p.K*min(m, p.K))
+	pivRow := make([]int, p.K)
+	for i := range pivRow {
+		pivRow[i] = -1
+	}
+	// Phase A: forward elimination
+	tA := time.Now()
+	r := 0
+	for c := 0; c < p.K && r < m; c++ {
+		pr := -1
+		for i := r; i < m; i++ {
+			if ((coeff[i][c>>6] >> uint(c&63)) & 1) == 1 {
+				pr = i
+				break
+			}
+		}
+		if pr == -1 {
+			continue
+		}
+		if pr != r {
+			coeff[r], coeff[pr] = coeff[pr], coeff[r]
+			oplog = append(oplog, op{kind: opSwap, i: r, j: pr})
+			metrics.RowSwaps++
+			// keep rowPos in sync for Phase B
+			rowPos[r], rowPos[pr] = rowPos[pr], rowPos[r]
+		}
+		pivRow[c] = r
+		for i := r + 1; i < m; i++ {
+			if ((coeff[i][c>>6] >> uint(c&63)) & 1) == 1 {
+				for w := 0; w < wordsK; w++ {
+					coeff[i][w] ^= coeff[r][w]
+				}
+				oplog = append(oplog, op{kind: opXor, i: i, j: r})
+				metrics.RowXors++
+			}
+		}
+		r++
+	}
+	// Back substitution
+	for c := p.K - 1; c >= 0; c-- {
+		pr := pivRow[c]
+		if pr == -1 {
+			continue
+		}
+		for i := 0; i < pr; i++ {
+			if ((coeff[i][c>>6] >> uint(c&63)) & 1) == 1 {
+				for w := 0; w < wordsK; w++ {
+					coeff[i][w] ^= coeff[pr][w]
+				}
+				oplog = append(oplog, op{kind: opXor, i: i, j: pr})
+				metrics.RowXors++
+			}
+		}
+	}
+	metrics.ElimTime = time.Since(tA)
+	rank := 0
+	for c := 0; c < p.K; c++ {
+		if pivRow[c] != -1 {
+			rank++
+		}
+	}
+	if rank < p.K {
+		return fact, metrics, false
+	}
+	// Build exported fact
+	fact.PivRow = pivRow
+	fact.Rank = rank
+	fact.RowPos = rowPos
+	fact.Present = append([]int(nil), present...)
+	fact.Oplog = make([]struct {
+		Kind uint8
+		I, J int
+	}, len(oplog))
+	for i, opx := range oplog {
+		fact.Oplog[i] = struct {
+			Kind uint8
+			I, J int
+		}{Kind: opx.kind, I: opx.i, J: opx.j}
+	}
+	return fact, metrics, true
+}
+
+// PacketPolarSolveWithFact replays the factorization ops on the provided data rows (aligned with fact.RowPos)
+// and extracts the K source outputs by pivot rows.
+func PacketPolarSolveWithFact(p *PacketPolarParams, fact PacketPolarFact, data [][]byte) ([][]byte, PacketPolarSplitMetrics) {
+	var metrics PacketPolarSplitMetrics
+	// Phase B: replay ops
+	tB := time.Now()
+	for _, opx := range fact.Oplog {
+		if opx.Kind == 0 { // swap
+			data[opx.I], data[opx.J] = data[opx.J], data[opx.I]
+		} else { // xor
+			xorBytes(data[opx.I], data[opx.J])
+			metrics.ApplyRowXors++
+			metrics.BytesXored += int64(len(data[opx.I]))
+		}
+	}
+	metrics.ApplyTime = time.Since(tB)
+	// Extract outputs
+	out := make([][]byte, p.K)
+	for i := 0; i < p.K; i++ {
+		out[i] = make([]byte, p.MaxLen)
+		copy(out[i], data[fact.PivRow[i]])
+	}
+	return out, metrics
+}
+
+// PacketPolarSolveBytesWithFact is a specialized variant for MaxLen==1 payloads.
+// It replays the factorization ops on a contiguous []byte rows buffer ordered the
+// same way as fact.Present/RowPos and extracts the K source bytes by pivot rows.
+func PacketPolarSolveBytesWithFact(p *PacketPolarParams, fact PacketPolarFact, rows []byte) ([]byte, PacketPolarSplitMetrics) {
+	var metrics PacketPolarSplitMetrics
+	if len(rows) < len(fact.Present) {
+		return nil, metrics
+	}
+	// Replay ops on bytes
+	tB := time.Now()
+	for _, opx := range fact.Oplog {
+		if opx.Kind == 0 { // swap
+			rows[opx.I], rows[opx.J] = rows[opx.J], rows[opx.I]
+		} else { // xor
+			rows[opx.I] ^= rows[opx.J]
+			metrics.ApplyRowXors++
+			metrics.BytesXored++
+		}
+	}
+	metrics.ApplyTime = time.Since(tB)
+	// Extract outputs
+	out := make([]byte, p.K)
+	for i := 0; i < p.K; i++ {
+		pr := fact.PivRow[i]
+		if pr >= 0 {
+			out[i] = rows[pr]
+		}
+	}
+	return out, metrics
+}
